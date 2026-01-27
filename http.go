@@ -195,7 +195,7 @@ func (p *HTTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, err
 		providerErr := ErrProviderDown("HTTP request failed", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Read response body
 	respBody, err := io.ReadAll(resp.Body)

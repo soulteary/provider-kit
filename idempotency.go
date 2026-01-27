@@ -163,11 +163,8 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 		return result, err
 	}
 
-	// Cache successful result
-	if err := p.store.Set(ctx, cacheKey, result, p.ttl); err != nil {
-		// Log error but don't fail the send
-		// In production, you would log this
-	}
+	// Cache successful result (ignore error - don't fail the send if cache fails)
+	_ = p.store.Set(ctx, cacheKey, result, p.ttl)
 
 	return result, nil
 }

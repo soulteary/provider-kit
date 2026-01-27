@@ -80,7 +80,7 @@ func TestProviderError_Unwrap(t *testing.T) {
 
 func TestProviderError_WithProvider(t *testing.T) {
 	err := NewProviderError(ReasonSendFailed, "test")
-	err.WithProvider("smtp", ChannelEmail)
+	err = err.WithProvider("smtp", ChannelEmail)
 
 	if err.ProviderName != "smtp" {
 		t.Errorf("WithProvider() ProviderName = %v, want smtp", err.ProviderName)

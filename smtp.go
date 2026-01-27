@@ -4,11 +4,23 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"net"
 	"net/smtp"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+// Function variables for testing
+var (
+	smtpSendMail  = smtp.SendMail
+	tlsDial       = tls.Dial
+	smtpDial      = smtp.Dial
+	smtpNewClient = func(conn net.Conn, host string) (*smtp.Client, error) {
+		return smtp.NewClient(conn, host)
+	}
 )
 
 // SMTPConfig contains SMTP provider configuration
@@ -59,10 +71,37 @@ func (c *SMTPConfig) Validate() error {
 	return nil
 }
 
+// SMTPDialer is the interface for SMTP connection operations
+type SMTPDialer interface {
+	// DialPlain dials SMTP server without encryption
+	DialPlain(addr string, auth interface{}, from string, to []string, body []byte) error
+	// DialTLS dials SMTP server with TLS
+	DialTLS(addr string, tlsConfig interface{}, host string) (SMTPClient, error)
+	// DialStartTLS dials SMTP server and upgrades to TLS
+	DialStartTLS(addr string, tlsConfig interface{}) (SMTPClient, error)
+}
+
+// SMTPClient is the interface for SMTP client operations
+type SMTPClient interface {
+	Auth(a interface{}) error
+	Mail(from string) error
+	Rcpt(to string) error
+	Data() (interface {
+		Write([]byte) (int, error)
+		Close() error
+	}, error)
+	Quit() error
+	Close() error
+}
+
+// DefaultSMTPDialer uses the standard library for SMTP
+type DefaultSMTPDialer struct{}
+
 // SMTPProvider implements email sending via SMTP
 type SMTPProvider struct {
 	config *SMTPConfig
 	name   string
+	dialer SMTPDialer // Optional custom dialer for testing
 }
 
 // NewSMTPProvider creates a new SMTP provider
@@ -89,7 +128,7 @@ func NewSMTPProviderFromMap(configMap map[string]string) (Provider, error) {
 		config.Host = host
 	}
 	if port, ok := configMap["port"]; ok {
-		fmt.Sscanf(port, "%d", &config.Port)
+		_, _ = fmt.Sscanf(port, "%d", &config.Port)
 	}
 	if username, ok := configMap["username"]; ok {
 		config.Username = username
@@ -129,6 +168,11 @@ func (p *SMTPProvider) Name() string {
 // Validate checks if the provider is properly configured
 func (p *SMTPProvider) Validate() error {
 	return p.config.Validate()
+}
+
+// SetDialer sets a custom dialer for testing
+func (p *SMTPProvider) SetDialer(dialer SMTPDialer) {
+	p.dialer = dialer
 }
 
 // Send sends an email via SMTP
@@ -209,7 +253,7 @@ func (p *SMTPProvider) sendPlain(addr, to string, body []byte) error {
 	if p.config.Username != "" {
 		auth = smtp.PlainAuth("", p.config.Username, p.config.Password, p.config.Host)
 	}
-	return smtp.SendMail(addr, auth, p.config.From, []string{to}, body)
+	return smtpSendMail(addr, auth, p.config.From, []string{to}, body)
 }
 
 // sendWithTLS sends email over TLS
@@ -219,28 +263,28 @@ func (p *SMTPProvider) sendWithTLS(addr, to string, body []byte) error {
 		ServerName:         p.config.Host,
 	}
 
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	conn, err := tlsDial("tcp", addr, tlsConfig)
 	if err != nil {
 		return fmt.Errorf("TLS dial failed: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
-	client, err := smtp.NewClient(conn, p.config.Host)
+	client, err := smtpNewClient(conn, p.config.Host)
 	if err != nil {
 		return fmt.Errorf("SMTP client creation failed: %w", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	return p.sendWithClient(client, to, body)
 }
 
 // sendWithStartTLS sends email using STARTTLS
 func (p *SMTPProvider) sendWithStartTLS(addr, to string, body []byte) error {
-	client, err := smtp.Dial(addr)
+	client, err := smtpDial(addr)
 	if err != nil {
 		return fmt.Errorf("SMTP dial failed: %w", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Send STARTTLS command
 	tlsConfig := &tls.Config{
@@ -254,8 +298,18 @@ func (p *SMTPProvider) sendWithStartTLS(addr, to string, body []byte) error {
 	return p.sendWithClient(client, to, body)
 }
 
+// smtpClientInterface defines the interface for SMTP client operations
+type smtpClientInterface interface {
+	Auth(a smtp.Auth) error
+	Mail(from string) error
+	Rcpt(to string) error
+	Data() (io.WriteCloser, error)
+	Quit() error
+	Close() error
+}
+
 // sendWithClient sends email using an established SMTP client
-func (p *SMTPProvider) sendWithClient(client *smtp.Client, to string, body []byte) error {
+func (p *SMTPProvider) sendWithClient(client smtpClientInterface, to string, body []byte) error {
 	// Authenticate if credentials provided
 	if p.config.Username != "" {
 		auth := smtp.PlainAuth("", p.config.Username, p.config.Password, p.config.Host)
