@@ -7,13 +7,13 @@
 
 [English](README.md)
 
-一个轻量级、可扩展的 Go 消息发送库，支持插件化 Provider、自动重试、幂等性和错误归一化。
+一个轻量级、可扩展的 Go 消息发送库，支持邮件、短信、钉钉等通道，通过插件化 Provider 实现，内置重试、幂等性与错误归一化。
 
 ## 功能特性
 
 - **Provider 接口** - 清晰的接口定义，便于实现自定义消息提供者
 - **Registry 模式** - 基于通道类型的集中式 Provider 管理
-- **内置 Provider** - SMTP 邮件发送、HTTP API 外部服务
+- **内置 Provider** - SMTP 邮件发送、HTTP API 外部服务（短信、钉钉等）
 - **自动重试** - 可配置的重试逻辑，支持指数退避
 - **幂等性支持** - 通过幂等键防止重复发送
 - **错误归一化** - 跨不同 Provider 的统一错误处理
@@ -173,7 +173,8 @@ smtpProvider, err := registry.CreateProvider("smtp", config)
 |------|------|
 | `ChannelSMS` | 短信消息通道 |
 | `ChannelEmail` | 邮件消息通道 |
-| `ChannelHTTP` | 通用 HTTP API 通道 |
+| `ChannelHTTP` | 通用 HTTP API 通道（外部短信、钉钉等） |
+| `ChannelDingTalk` | 钉钉工作通知通道（通过 herald-dingtalk HTTP 服务） |
 
 ### Provider 接口
 

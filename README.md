@@ -7,13 +7,13 @@
 
 [中文文档](README_CN.md)
 
-A lightweight, extensible Go library for sending messages (email, SMS, etc.) through pluggable providers with built-in retry, idempotency, and error normalization.
+A lightweight, extensible Go library for sending messages (email, SMS, DingTalk, etc.) through pluggable providers with built-in retry, idempotency, and error normalization.
 
 ## Features
 
 - **Provider Interface** - Clean interface for implementing custom message providers
 - **Registry Pattern** - Centralized provider management with channel-based routing
-- **Built-in Providers** - SMTP for email, HTTP API for external services
+- **Built-in Providers** - SMTP for email, HTTP API for external services (SMS, DingTalk, etc.)
 - **Automatic Retry** - Configurable retry logic with exponential backoff
 - **Idempotency Support** - Prevent duplicate sends with idempotency keys
 - **Error Normalization** - Unified error handling across different providers
@@ -173,7 +173,8 @@ smtpProvider, err := registry.CreateProvider("smtp", config)
 |---------|-------------|
 | `ChannelSMS` | SMS message channel |
 | `ChannelEmail` | Email message channel |
-| `ChannelHTTP` | Generic HTTP API channel |
+| `ChannelHTTP` | Generic HTTP API channel (for external SMS, DingTalk, etc.) |
+| `ChannelDingTalk` | DingTalk work notification channel (via herald-dingtalk HTTP service) |
 
 ### Provider Interface
 
