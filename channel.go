@@ -10,6 +10,8 @@ const (
 	ChannelEmail Channel = "email"
 	// ChannelHTTP represents generic HTTP API channel (for extensibility)
 	ChannelHTTP Channel = "http"
+	// ChannelDingTalk represents DingTalk work notification (via herald-dingtalk HTTP service)
+	ChannelDingTalk Channel = "dingtalk"
 )
 
 // String returns the string representation of the channel
@@ -20,7 +22,7 @@ func (c Channel) String() string {
 // IsValid checks if the channel is a valid known channel type
 func (c Channel) IsValid() bool {
 	switch c {
-	case ChannelSMS, ChannelEmail, ChannelHTTP:
+	case ChannelSMS, ChannelEmail, ChannelHTTP, ChannelDingTalk:
 		return true
 	default:
 		return false
@@ -29,5 +31,5 @@ func (c Channel) IsValid() bool {
 
 // SupportedChannels returns all supported channels
 func SupportedChannels() []Channel {
-	return []Channel{ChannelSMS, ChannelEmail, ChannelHTTP}
+	return []Channel{ChannelSMS, ChannelEmail, ChannelHTTP, ChannelDingTalk}
 }

@@ -45,14 +45,15 @@ func TestChannel_IsValid(t *testing.T) {
 
 func TestSupportedChannels(t *testing.T) {
 	channels := SupportedChannels()
-	if len(channels) != 3 {
-		t.Errorf("SupportedChannels() returned %d channels, want 3", len(channels))
+	if len(channels) != 4 {
+		t.Errorf("SupportedChannels() returned %d channels, want 4", len(channels))
 	}
 
 	expected := map[Channel]bool{
-		ChannelSMS:   false,
-		ChannelEmail: false,
-		ChannelHTTP:  false,
+		ChannelSMS:      false,
+		ChannelEmail:    false,
+		ChannelHTTP:     false,
+		ChannelDingTalk: false,
 	}
 
 	for _, ch := range channels {
