@@ -165,6 +165,12 @@ config := map[string]string{
 smtpProvider, err := registry.CreateProvider("smtp", config)
 ```
 
+## Security Notes
+
+- **Header injection protection**: Do not include `\r` or `\n` in `To`, `Subject`, or `IdempotencyKey` fields. These values are used in SMTP headers and are rejected if they contain control characters. Validate or sanitize user input before calling the library.
+- **SMTP transport**: Avoid plaintext SMTP when using authentication. Prefer TLS (`UseTLS`) or STARTTLS (`UseStartTLS`) and keep `SkipTLSVerify` disabled unless you fully understand the risk.
+- **HTTP provider**: `BaseURL` must include an `http` or `https` scheme. Prefer `https` to protect API keys and payloads in transit.
+
 ## API Reference
 
 ### Channel Types

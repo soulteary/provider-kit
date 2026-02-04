@@ -68,6 +68,12 @@ func (c *SMTPConfig) Validate() error {
 	if c.From == "" {
 		return ErrInvalidConfig("SMTP from address is required")
 	}
+	if err := validateNoCRLF("From", c.From); err != nil {
+		return err
+	}
+	if err := validateNoCRLF("FromName", c.FromName); err != nil {
+		return err
+	}
 	return nil
 }
 

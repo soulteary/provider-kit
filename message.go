@@ -1,6 +1,9 @@
 package provider
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Message represents a message to be sent via a provider
 type Message struct {
@@ -112,6 +115,15 @@ func (m *Message) Validate() error {
 	if m.To == "" {
 		return ErrInvalidDestination("destination (To) is required")
 	}
+	if err := validateNoCRLF("To", m.To); err != nil {
+		return err
+	}
+	if err := validateNoCRLF("Subject", m.Subject); err != nil {
+		return err
+	}
+	if err := validateNoCRLF("IdempotencyKey", m.IdempotencyKey); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -167,4 +179,11 @@ func maskDestination(dest string) string {
 	}
 	// For phone: show last 4 digits
 	return "***" + dest[len(dest)-4:]
+}
+
+func validateNoCRLF(field, value string) error {
+	if strings.ContainsAny(value, "\r\n") {
+		return ErrValidationFailed(fmt.Sprintf("%s contains invalid control characters", field))
+	}
+	return nil
 }

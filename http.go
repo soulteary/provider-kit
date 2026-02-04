@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +49,13 @@ func DefaultHTTPConfig() *HTTPConfig {
 func (c *HTTPConfig) Validate() error {
 	if c.BaseURL == "" {
 		return ErrInvalidConfig("HTTP base URL is required")
+	}
+	parsedBaseURL, err := url.Parse(c.BaseURL)
+	if err != nil || parsedBaseURL.Host == "" {
+		return ErrInvalidConfig("HTTP base URL is invalid")
+	}
+	if parsedBaseURL.Scheme != "http" && parsedBaseURL.Scheme != "https" {
+		return ErrInvalidConfig("HTTP base URL must include http or https scheme")
 	}
 	return nil
 }
@@ -172,8 +180,18 @@ func (p *HTTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, err
 	}
 
 	// Build HTTP request
-	url := p.config.BaseURL + p.config.SendEndpoint
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
+	baseURL, err := url.Parse(p.config.BaseURL)
+	if err != nil {
+		providerErr := ErrSendFailed("failed to parse base URL", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+	}
+	endpointURL, err := url.Parse(p.config.SendEndpoint)
+	if err != nil {
+		providerErr := ErrSendFailed("failed to parse send endpoint", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+	}
+	fullURL := baseURL.ResolveReference(endpointURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL.String(), bytes.NewReader(jsonBody))
 	if err != nil {
 		providerErr := ErrSendFailed("failed to create request", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr

@@ -68,6 +68,25 @@ func TestSMTPConfig_Validate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "from with newline",
+			config: &SMTPConfig{
+				Host: "smtp.example.com",
+				Port: 587,
+				From: "noreply@example.com\r\nBcc:bad@example.com",
+			},
+			wantErr: true,
+		},
+		{
+			name: "from name with newline",
+			config: &SMTPConfig{
+				Host:     "smtp.example.com",
+				Port:     587,
+				From:     "noreply@example.com",
+				FromName: "Sender\r\nBcc:bad@example.com",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

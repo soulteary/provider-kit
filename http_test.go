@@ -43,6 +43,27 @@ func TestHTTPConfig_Validate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "invalid base URL",
+			config: &HTTPConfig{
+				BaseURL: "://bad-url",
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing scheme",
+			config: &HTTPConfig{
+				BaseURL: "api.example.com",
+			},
+			wantErr: true,
+		},
+		{
+			name: "unsupported scheme",
+			config: &HTTPConfig{
+				BaseURL: "ftp://api.example.com",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

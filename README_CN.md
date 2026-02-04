@@ -165,6 +165,12 @@ config := map[string]string{
 smtpProvider, err := registry.CreateProvider("smtp", config)
 ```
 
+## 安全注意事项
+
+- **头部注入防护**：`To`、`Subject`、`IdempotencyKey` 不能包含 `\r` 或 `\n` 等控制字符，这些字段会写入 SMTP 头部，库会拒绝包含控制字符的输入。请在调用前做好输入校验或清理。
+- **SMTP 传输**：使用认证时避免明文 SMTP，优先使用 TLS (`UseTLS`) 或 STARTTLS (`UseStartTLS`)，除非明确了解风险，否则不要启用 `SkipTLSVerify`。
+- **HTTP Provider**：`BaseURL` 必须包含 `http` 或 `https` 协议，推荐使用 `https` 以保护 API Key 和消息内容。
+
 ## API 参考
 
 ### 通道类型

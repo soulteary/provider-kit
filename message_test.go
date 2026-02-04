@@ -117,6 +117,23 @@ func TestMessage_Validate(t *testing.T) {
 			msg:     NewMessage(""),
 			wantErr: true,
 		},
+		{
+			name:    "invalid destination with newline",
+			msg:     NewMessage("test@example.com\r\nBcc:bad@example.com"),
+			wantErr: true,
+		},
+		{
+			name: "invalid subject with newline",
+			msg: NewMessage("test@example.com").
+				WithSubject("Hello\r\nBcc:bad@example.com"),
+			wantErr: true,
+		},
+		{
+			name: "invalid idempotency key with newline",
+			msg: NewMessage("test@example.com").
+				WithIdempotencyKey("idem\r\nkey"),
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
