@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -141,6 +142,57 @@ func TestHTTPProvider_Name(t *testing.T) {
 
 	if provider.Name() != "custom-provider" {
 		t.Errorf("Name() = %v, want custom-provider", provider.Name())
+	}
+}
+
+func TestResolveSendURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		base     string
+		endpoint string
+		want     string
+	}{
+		{
+			name:     "relative endpoint keeps base path",
+			base:     "https://api.example.com/api/v2",
+			endpoint: "v1/send",
+			want:     "https://api.example.com/api/v2/v1/send",
+		},
+		{
+			name:     "absolute endpoint keeps base path",
+			base:     "https://api.example.com/api/v2",
+			endpoint: "/v1/send",
+			want:     "https://api.example.com/api/v2/v1/send",
+		},
+		{
+			name:     "base root with absolute endpoint",
+			base:     "https://api.example.com",
+			endpoint: "/v1/send",
+			want:     "https://api.example.com/v1/send",
+		},
+		{
+			name:     "endpoint with query and fragment",
+			base:     "https://api.example.com/api",
+			endpoint: "/v1/send?mode=test#section",
+			want:     "https://api.example.com/api/v1/send?mode=test#section",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			baseURL, err := url.Parse(tt.base)
+			if err != nil {
+				t.Fatalf("failed to parse base URL: %v", err)
+			}
+			endpointURL, err := url.Parse(tt.endpoint)
+			if err != nil {
+				t.Fatalf("failed to parse endpoint URL: %v", err)
+			}
+			got := resolveSendURL(baseURL, endpointURL)
+			if got.String() != tt.want {
+				t.Errorf("resolveSendURL() = %v, want %v", got.String(), tt.want)
+			}
+		})
 	}
 }
 

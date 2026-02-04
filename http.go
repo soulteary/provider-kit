@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -190,7 +192,7 @@ func (p *HTTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, err
 		providerErr := ErrSendFailed("failed to parse send endpoint", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
 	}
-	fullURL := baseURL.ResolveReference(endpointURL)
+	fullURL := resolveSendURL(baseURL, endpointURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL.String(), bytes.NewReader(jsonBody))
 	if err != nil {
 		providerErr := ErrSendFailed("failed to create request", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
@@ -284,4 +286,24 @@ func (p *HTTPProvider) SetHTTPClient(client *http.Client) {
 // HTTPProviderFactory is the factory for HTTP providers
 func HTTPProviderFactory(config map[string]string) (Provider, error) {
 	return NewHTTPProviderFromMap(config)
+}
+
+func resolveSendURL(baseURL *url.URL, endpointURL *url.URL) *url.URL {
+	resolved := *baseURL
+	if endpointURL == nil {
+		return &resolved
+	}
+
+	basePath := strings.TrimSuffix(resolved.Path, "/")
+	endpointPath := strings.TrimPrefix(endpointURL.Path, "/")
+	if endpointPath != "" {
+		resolved.Path = path.Join(basePath, endpointPath)
+	}
+	if endpointURL.RawQuery != "" {
+		resolved.RawQuery = endpointURL.RawQuery
+	}
+	if endpointURL.Fragment != "" {
+		resolved.Fragment = endpointURL.Fragment
+	}
+	return &resolved
 }
