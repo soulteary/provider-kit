@@ -217,17 +217,17 @@ func (p *SMTPProvider) buildEmailBody(msg *Message) []byte {
 
 	// From header
 	if p.config.FromName != "" {
-		sb.WriteString(fmt.Sprintf("From: %s <%s>\r\n", p.config.FromName, p.config.From))
+		fmt.Fprintf(&sb, "From: %s <%s>\r\n", p.config.FromName, p.config.From)
 	} else {
-		sb.WriteString(fmt.Sprintf("From: %s\r\n", p.config.From))
+		fmt.Fprintf(&sb, "From: %s\r\n", p.config.From)
 	}
 
 	// To header
-	sb.WriteString(fmt.Sprintf("To: %s\r\n", msg.To))
+	fmt.Fprintf(&sb, "To: %s\r\n", msg.To)
 
 	// Subject header
 	if msg.Subject != "" {
-		sb.WriteString(fmt.Sprintf("Subject: %s\r\n", msg.Subject))
+		fmt.Fprintf(&sb, "Subject: %s\r\n", msg.Subject)
 	}
 
 	// Content-Type header
@@ -235,7 +235,7 @@ func (p *SMTPProvider) buildEmailBody(msg *Message) []byte {
 
 	// Message-ID header
 	if msg.IdempotencyKey != "" {
-		sb.WriteString(fmt.Sprintf("Message-ID: <%s@%s>\r\n", msg.IdempotencyKey, p.config.Host))
+		fmt.Fprintf(&sb, "Message-ID: <%s@%s>\r\n", msg.IdempotencyKey, p.config.Host)
 	}
 
 	// Empty line before body
