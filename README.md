@@ -1,7 +1,7 @@
 # provider-kit
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/provider-kit.svg)](https://pkg.go.dev/github.com/soulteary/provider-kit)
-[![Go Report Card](https://goreportcard.com/badge/github.com/soulteary/provider-kit)](https://goreportcard.com/report/github.com/soulteary/provider-kit)
+[![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/soulteary/provider-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/provider-kit)
 
