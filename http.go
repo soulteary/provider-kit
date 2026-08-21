@@ -3,14 +3,38 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// RedirectPolicy controls how the HTTP provider handles 3xx redirects.
+type RedirectPolicy string
+
+const (
+	// RedirectDeny refuses to follow any redirect (safest default).
+	RedirectDeny RedirectPolicy = "deny"
+	// RedirectSameOrigin follows a redirect only when scheme+host are identical
+	// to the original request; credentials are never re-sent on redirect.
+	RedirectSameOrigin RedirectPolicy = "same-origin"
+)
+
+// defaultMaxResponseBytes bounds how much of a provider response body we will
+// read, preventing a hostile or misbehaving provider from exhausting memory.
+const defaultMaxResponseBytes int64 = 1 << 20 // 1 MiB
+
+// minProviderTimeout is a floor applied when a caller constructs HTTPConfig
+// directly and leaves Timeout at its zero value (which would otherwise mean "no
+// timeout" and allow a provider that never responds to hang a request forever).
+const minProviderTimeout = 30 * time.Second
 
 // HTTPConfig contains HTTP API provider configuration
 type HTTPConfig struct {
@@ -30,24 +54,48 @@ type HTTPConfig struct {
 	ChannelType Channel
 	// ProviderName is the name of this provider instance
 	ProviderName string
+	// MaxResponseBytes bounds the response body read (default 1 MiB). A value
+	// <= 0 uses the default.
+	MaxResponseBytes int64
+	// Redirect controls redirect handling (default: deny).
+	Redirect RedirectPolicy
+	// RequireHTTPS rejects non-https BaseURLs at construction time.
+	RequireHTTPS bool
 }
 
 // DefaultHTTPConfig returns default HTTP configuration
 func DefaultHTTPConfig() *HTTPConfig {
 	return &HTTPConfig{
-		SendEndpoint: "/v1/send",
-		APIKeyHeader: "X-API-Key",
-		Timeout:      30 * time.Second,
-		Headers:      make(map[string]string),
-		ChannelType:  ChannelHTTP,
-		ProviderName: "http",
+		SendEndpoint:     "/v1/send",
+		APIKeyHeader:     "X-API-Key",
+		Timeout:          30 * time.Second,
+		Headers:          make(map[string]string),
+		ChannelType:      ChannelHTTP,
+		ProviderName:     "http",
+		MaxResponseBytes: defaultMaxResponseBytes,
+		Redirect:         RedirectDeny,
 	}
 }
 
-// Validate validates the HTTP configuration
+// Validate validates the HTTP configuration. It parses BaseURL and rejects
+// unsupported schemes so a plaintext or malformed URL fails fast at
+// construction time instead of at first send.
 func (c *HTTPConfig) Validate() error {
 	if c.BaseURL == "" {
 		return ErrInvalidConfig("HTTP base URL is required")
+	}
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return ErrInvalidConfig("HTTP base URL is not a valid URL: " + err.Error())
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ErrInvalidConfig("HTTP base URL must use http or https scheme")
+	}
+	if u.Host == "" {
+		return ErrInvalidConfig("HTTP base URL must include a host")
+	}
+	if c.RequireHTTPS && u.Scheme != "https" {
+		return ErrInvalidConfig("HTTP base URL must use https scheme")
 	}
 	return nil
 }
@@ -69,13 +117,64 @@ func NewHTTPProvider(config *HTTPConfig) (*HTTPProvider, error) {
 		return nil, err
 	}
 
-	return &HTTPProvider{
-		config: config,
-		httpClient: &http.Client{
-			Timeout: config.Timeout,
+	// Enforce a timeout floor: a zero Timeout on http.Client means "no timeout",
+	// which lets a provider that never responds hang the caller indefinitely.
+	timeout := config.Timeout
+	if timeout <= 0 {
+		timeout = minProviderTimeout
+	}
+	if config.MaxResponseBytes <= 0 {
+		config.MaxResponseBytes = defaultMaxResponseBytes
+	}
+	if config.Redirect == "" {
+		config.Redirect = RedirectDeny
+	}
+	if config.APIKeyHeader == "" {
+		config.APIKeyHeader = "X-API-Key"
+	}
+
+	client := &http.Client{
+		Timeout:       timeout,
+		CheckRedirect: makeCheckRedirect(config),
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 		},
+	}
+
+	return &HTTPProvider{
+		config:     config,
+		httpClient: client,
 	}, nil
 }
+
+// makeCheckRedirect returns a CheckRedirect function enforcing the configured
+// redirect policy. It never forwards the API key / Authorization headers across
+// a redirect and blocks cross-origin or scheme-downgrade redirects.
+func makeCheckRedirect(config *HTTPConfig) func(req *http.Request, via []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		if config.Redirect == RedirectDeny {
+			return errRedirectBlocked
+		}
+		orig := via[0].URL
+		// same-origin: scheme AND host must match the original request, and we
+		// never downgrade https->http.
+		if !strings.EqualFold(req.URL.Scheme, orig.Scheme) || !strings.EqualFold(req.URL.Host, orig.Host) {
+			return errRedirectBlocked
+		}
+		// Defense in depth: strip any credential headers on the redirected
+		// request even for a same-origin redirect.
+		req.Header.Del("Authorization")
+		if config.APIKeyHeader != "" {
+			req.Header.Del(config.APIKeyHeader)
+		}
+		return nil
+	}
+}
+
+var errRedirectBlocked = errors.New("provider redirect blocked by policy")
 
 // NewHTTPProviderFromMap creates an HTTP provider from a configuration map
 func NewHTTPProviderFromMap(configMap map[string]string) (Provider, error) {
@@ -171,9 +270,26 @@ func (p *HTTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, err
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
 	}
 
-	// Build HTTP request
-	url := p.config.BaseURL + p.config.SendEndpoint
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
+	// Build HTTP request. Resolve the endpoint against the parsed base URL so a
+	// stray/missing slash or an absolute endpoint cannot silently retarget the
+	// request to a different host.
+	base, err := url.Parse(p.config.BaseURL)
+	if err != nil {
+		providerErr := ErrSendFailed("invalid base URL", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+	}
+	ref, err := url.Parse(p.config.SendEndpoint)
+	if err != nil {
+		providerErr := ErrSendFailed("invalid send endpoint", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+	}
+	resolved := base.ResolveReference(ref)
+	// A relative send endpoint must not change the origin.
+	if !strings.EqualFold(resolved.Scheme, base.Scheme) || !strings.EqualFold(resolved.Host, base.Host) {
+		providerErr := ErrSendFailed("send endpoint resolves to a different origin", nil).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, resolved.String(), bytes.NewReader(jsonBody))
 	if err != nil {
 		providerErr := ErrSendFailed("failed to create request", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
@@ -197,8 +313,13 @@ func (p *HTTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Read response body
-	respBody, err := io.ReadAll(resp.Body)
+	// Read response body with a hard cap so a hostile/oversized response cannot
+	// exhaust memory.
+	limit := p.config.MaxResponseBytes
+	if limit <= 0 {
+		limit = defaultMaxResponseBytes
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
 		providerErr := ErrSendFailed("failed to read response", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
