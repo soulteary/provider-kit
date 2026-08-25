@@ -3,21 +3,27 @@ package provider
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
+	"net/mail"
 	"net/smtp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
 
 // Function variables for testing
 var (
-	smtpSendMail  = smtp.SendMail
-	tlsDial       = tls.Dial
-	smtpDial      = smtp.Dial
+	smtpDialContext = func(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error) {
+		dialer := &net.Dialer{Timeout: timeout}
+		return dialer.DialContext(ctx, network, address)
+	}
 	smtpNewClient = func(conn net.Conn, host string) (*smtp.Client, error) {
 		return smtp.NewClient(conn, host)
 	}
@@ -62,11 +68,26 @@ func (c *SMTPConfig) Validate() error {
 	if c.Host == "" {
 		return ErrInvalidConfig("SMTP host is required")
 	}
+	if strings.TrimSpace(c.Host) != c.Host || containsHeaderControl(c.Host) || strings.ContainsAny(c.Host, " \t") {
+		return ErrInvalidConfig("SMTP host is invalid")
+	}
 	if c.Port <= 0 || c.Port > 65535 {
 		return ErrInvalidConfig("SMTP port is invalid")
 	}
 	if c.From == "" {
 		return ErrInvalidConfig("SMTP from address is required")
+	}
+	if containsHeaderControl(c.From) {
+		return ErrInvalidConfig("SMTP from address is invalid")
+	}
+	if _, err := mail.ParseAddress(c.From); err != nil {
+		return ErrInvalidConfig("SMTP from address is invalid")
+	}
+	if containsHeaderControl(c.FromName) || !utf8.ValidString(c.FromName) {
+		return ErrInvalidConfig("SMTP from name is invalid")
+	}
+	if c.Timeout < 0 {
+		return ErrInvalidConfig("SMTP timeout must not be negative")
 	}
 	return nil
 }
@@ -109,13 +130,17 @@ func NewSMTPProvider(config *SMTPConfig) (*SMTPProvider, error) {
 	if config == nil {
 		config = DefaultSMTPConfig()
 	}
+	configCopy := *config
+	if configCopy.Timeout == 0 {
+		configCopy.Timeout = 30 * time.Second
+	}
 
-	if err := config.Validate(); err != nil {
+	if err := configCopy.Validate(); err != nil {
 		return nil, err
 	}
 
 	return &SMTPProvider{
-		config: config,
+		config: &configCopy,
 		name:   "smtp",
 	}, nil
 }
@@ -177,66 +202,80 @@ func (p *SMTPProvider) SetDialer(dialer SMTPDialer) {
 
 // Send sends an email via SMTP
 func (p *SMTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, error) {
+	if msg == nil {
+		err := ErrValidationFailed("message is required").WithProvider(p.name, ChannelEmail)
+		return NewFailureResult(p.name, ChannelEmail, err), err
+	}
 	if err := msg.Validate(); err != nil {
 		return NewFailureResult(p.name, ChannelEmail, NormalizeError(err, ChannelEmail, p.name)), err
 	}
-
-	// Build email message
-	emailBody := p.buildEmailBody(msg)
-
-	// Get SMTP address
-	addr := fmt.Sprintf("%s:%d", p.config.Host, p.config.Port)
-
-	// Send email based on TLS configuration
-	var err error
-	if p.config.UseTLS {
-		err = p.sendWithTLS(addr, msg.To, emailBody)
-	} else if p.config.UseStartTLS {
-		err = p.sendWithStartTLS(addr, msg.To, emailBody)
-	} else {
-		err = p.sendPlain(addr, msg.To, emailBody)
-	}
-
+	to, err := parseRecipient(msg.To)
 	if err != nil {
-		providerErr := ErrSendFailed("failed to send email", err).WithProvider(p.name, ChannelEmail)
+		providerErr := ErrInvalidDestination("recipient email address is invalid").WithProvider(p.name, ChannelEmail).WithError(err)
+		return NewFailureResult(p.name, ChannelEmail, providerErr), providerErr
+	}
+	if err := validateHeaderValue("subject", msg.Subject); err != nil {
+		providerErr := ErrValidationFailed(err.Error()).WithProvider(p.name, ChannelEmail)
 		return NewFailureResult(p.name, ChannelEmail, providerErr), providerErr
 	}
 
-	// Generate message ID
-	messageID := uuid.New().String()
-	if msg.IdempotencyKey != "" {
-		messageID = msg.IdempotencyKey
+	wireMessageID := uuid.New().String()
+	emailBody := p.buildEmailBody(msg, to, wireMessageID)
+
+	// Get SMTP address
+	addr := net.JoinHostPort(p.config.Host, strconv.Itoa(p.config.Port))
+
+	// Send email based on TLS configuration
+	var sendErr error
+	if p.config.UseTLS {
+		sendErr = p.sendWithTLS(ctx, addr, to.Address, emailBody)
+	} else if p.config.UseStartTLS {
+		sendErr = p.sendWithStartTLS(ctx, addr, to.Address, emailBody)
+	} else {
+		sendErr = p.sendPlain(ctx, addr, to.Address, emailBody)
 	}
 
-	return NewSuccessResult(p.name, ChannelEmail, messageID), nil
+	if sendErr != nil {
+		providerErr := p.normalizeSendError(ctx, sendErr)
+		return NewFailureResult(p.name, ChannelEmail, providerErr), providerErr
+	}
+
+	resultMessageID := wireMessageID
+	if msg.IdempotencyKey != "" {
+		// Preserve the existing SendResult contract while keeping caller input out
+		// of the RFC 5322 Message-ID header.
+		resultMessageID = msg.IdempotencyKey
+	}
+	return NewSuccessResult(p.name, ChannelEmail, resultMessageID), nil
 }
 
 // buildEmailBody constructs the email body with headers
-func (p *SMTPProvider) buildEmailBody(msg *Message) []byte {
+func (p *SMTPProvider) buildEmailBody(msg *Message, to *mail.Address, messageID string) []byte {
 	var sb strings.Builder
+	from, _ := mail.ParseAddress(p.config.From)
 
 	// From header
 	if p.config.FromName != "" {
-		fmt.Fprintf(&sb, "From: %s <%s>\r\n", p.config.FromName, p.config.From)
+		from.Name = p.config.FromName
+		fmt.Fprintf(&sb, "From: %s\r\n", formatAddress(from))
 	} else {
-		fmt.Fprintf(&sb, "From: %s\r\n", p.config.From)
+		fmt.Fprintf(&sb, "From: %s\r\n", formatAddress(from))
 	}
 
 	// To header
-	fmt.Fprintf(&sb, "To: %s\r\n", msg.To)
+	fmt.Fprintf(&sb, "To: %s\r\n", formatAddress(to))
 
 	// Subject header
 	if msg.Subject != "" {
-		fmt.Fprintf(&sb, "Subject: %s\r\n", msg.Subject)
+		fmt.Fprintf(&sb, "Subject: %s\r\n", mime.QEncoding.Encode("UTF-8", msg.Subject))
 	}
 
+	sb.WriteString("MIME-Version: 1.0\r\n")
 	// Content-Type header
 	sb.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 
 	// Message-ID header
-	if msg.IdempotencyKey != "" {
-		fmt.Fprintf(&sb, "Message-ID: <%s@%s>\r\n", msg.IdempotencyKey, p.config.Host)
-	}
+	fmt.Fprintf(&sb, "Message-ID: <%s@%s>\r\n", messageID, messageIDDomain(from.Address))
 
 	// Empty line before body
 	sb.WriteString("\r\n")
@@ -248,26 +287,12 @@ func (p *SMTPProvider) buildEmailBody(msg *Message) []byte {
 }
 
 // sendPlain sends email without encryption
-func (p *SMTPProvider) sendPlain(addr, to string, body []byte) error {
-	var auth smtp.Auth
-	if p.config.Username != "" {
-		auth = smtp.PlainAuth("", p.config.Username, p.config.Password, p.config.Host)
-	}
-	return smtpSendMail(addr, auth, p.config.From, []string{to}, body)
-}
-
-// sendWithTLS sends email over TLS
-func (p *SMTPProvider) sendWithTLS(addr, to string, body []byte) error {
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: p.config.SkipTLSVerify,
-		ServerName:         p.config.Host,
-	}
-
-	conn, err := tlsDial("tcp", addr, tlsConfig)
+func (p *SMTPProvider) sendPlain(ctx context.Context, addr, to string, body []byte) error {
+	conn, cleanup, err := p.dial(ctx, addr)
 	if err != nil {
-		return fmt.Errorf("TLS dial failed: %w", err)
+		return fmt.Errorf("SMTP dial failed: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer cleanup()
 
 	client, err := smtpNewClient(conn, p.config.Host)
 	if err != nil {
@@ -278,24 +303,133 @@ func (p *SMTPProvider) sendWithTLS(addr, to string, body []byte) error {
 	return p.sendWithClient(client, to, body)
 }
 
+// sendWithTLS sends email over TLS
+func (p *SMTPProvider) sendWithTLS(ctx context.Context, addr, to string, body []byte) error {
+	conn, cleanup, err := p.dial(ctx, addr)
+	if err != nil {
+		return fmt.Errorf("TLS dial failed: %w", err)
+	}
+	defer cleanup()
+
+	tlsConn := tls.Client(conn, p.tlsConfig())
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return fmt.Errorf("TLS handshake failed: %w", err)
+	}
+
+	client, err := smtpNewClient(tlsConn, p.config.Host)
+	if err != nil {
+		return fmt.Errorf("SMTP client creation failed: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	return p.sendWithClient(client, to, body)
+}
+
 // sendWithStartTLS sends email using STARTTLS
-func (p *SMTPProvider) sendWithStartTLS(addr, to string, body []byte) error {
-	client, err := smtpDial(addr)
+func (p *SMTPProvider) sendWithStartTLS(ctx context.Context, addr, to string, body []byte) error {
+	conn, cleanup, err := p.dial(ctx, addr)
 	if err != nil {
 		return fmt.Errorf("SMTP dial failed: %w", err)
+	}
+	defer cleanup()
+
+	client, err := smtpNewClient(conn, p.config.Host)
+	if err != nil {
+		return fmt.Errorf("SMTP client creation failed: %w", err)
 	}
 	defer func() { _ = client.Close() }()
 
 	// Send STARTTLS command
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: p.config.SkipTLSVerify,
-		ServerName:         p.config.Host,
-	}
-	if err := client.StartTLS(tlsConfig); err != nil {
+	if err := client.StartTLS(p.tlsConfig()); err != nil {
 		return fmt.Errorf("STARTTLS failed: %w", err)
 	}
 
 	return p.sendWithClient(client, to, body)
+}
+
+func (p *SMTPProvider) dial(ctx context.Context, addr string) (net.Conn, func(), error) {
+	conn, err := smtpDialContext(ctx, "tcp", addr, p.config.Timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	deadline := time.Now().Add(p.config.Timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	cleanup := func() {
+		stopCancel()
+		_ = conn.Close()
+	}
+	return conn, cleanup, nil
+}
+
+func (p *SMTPProvider) tlsConfig() *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: p.config.SkipTLSVerify,
+		ServerName:         p.config.Host,
+		MinVersion:         tls.VersionTLS12,
+	}
+}
+
+func (p *SMTPProvider) normalizeSendError(ctx context.Context, err error) *ProviderError {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return ErrTimeout("SMTP send timed out", err).WithProvider(p.name, ChannelEmail)
+	}
+	if errors.Is(err, context.Canceled) {
+		return ErrSendFailed("SMTP send canceled", err).WithProvider(p.name, ChannelEmail)
+	}
+	return ErrSendFailed("failed to send email", err).WithProvider(p.name, ChannelEmail)
+}
+
+func parseRecipient(raw string) (*mail.Address, error) {
+	if containsHeaderControl(raw) {
+		return nil, fmt.Errorf("recipient contains prohibited control characters")
+	}
+	address, err := mail.ParseAddress(raw)
+	if err != nil || address.Address == "" {
+		return nil, fmt.Errorf("invalid recipient email address")
+	}
+	return address, nil
+}
+
+func validateHeaderValue(field, value string) error {
+	if containsHeaderControl(value) {
+		return fmt.Errorf("%s contains prohibited control characters", field)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s is not valid UTF-8", field)
+	}
+	return nil
+}
+
+func containsHeaderControl(value string) bool {
+	return strings.ContainsAny(value, "\r\n\x00")
+}
+
+func formatAddress(address *mail.Address) string {
+	if address.Name == "" {
+		return address.Address
+	}
+	return address.String()
+}
+
+func messageIDDomain(from string) string {
+	if at := strings.LastIndexByte(from, '@'); at >= 0 && at+1 < len(from) {
+		return from[at+1:]
+	}
+	return "localhost"
 }
 
 // smtpClientInterface defines the interface for SMTP client operations
@@ -319,7 +453,8 @@ func (p *SMTPProvider) sendWithClient(client smtpClientInterface, to string, bod
 	}
 
 	// Set sender
-	if err := client.Mail(p.config.From); err != nil {
+	from, _ := mail.ParseAddress(p.config.From)
+	if err := client.Mail(from.Address); err != nil {
 		return fmt.Errorf("MAIL FROM failed: %w", err)
 	}
 

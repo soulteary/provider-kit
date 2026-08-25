@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"net/mail"
 	"strings"
 	"testing"
 )
@@ -58,7 +59,7 @@ func TestSMTPProvider_buildEmailBody(t *testing.T) {
 			msg: NewMessage("recipient@example.com").
 				WithBody("Body"),
 			wantParts: []string{
-				"From: Test Sender <sender@example.com>\r\n",
+				"From: \"Test Sender\" <sender@example.com>\r\n",
 				"To: recipient@example.com\r\n",
 			},
 		},
@@ -90,8 +91,9 @@ func TestSMTPProvider_buildEmailBody(t *testing.T) {
 				WithBody("Body").
 				WithIdempotencyKey("unique-key-123"),
 			wantParts: []string{
-				"Message-ID: <unique-key-123@smtp.example.com>\r\n",
+				"Message-ID: <test-message-id@example.com>\r\n",
 			},
+			notWant: []string{"unique-key-123"},
 		},
 	}
 
@@ -102,7 +104,11 @@ func TestSMTPProvider_buildEmailBody(t *testing.T) {
 				name:   "smtp",
 			}
 
-			body := provider.buildEmailBody(tt.msg)
+			to, err := mail.ParseAddress(tt.msg.To)
+			if err != nil {
+				t.Fatalf("mail.ParseAddress() error = %v", err)
+			}
+			body := provider.buildEmailBody(tt.msg, to, "test-message-id")
 			bodyStr := string(body)
 
 			for _, part := range tt.wantParts {
@@ -173,8 +179,7 @@ func TestSMTPProvider_Send_TLSModes(t *testing.T) {
 }
 
 func TestSMTPProvider_Send_WithIdempotencyKey(t *testing.T) {
-	// This test exercises the idempotency key path in Send
-	// The send will fail but we can verify the result includes the key
+	// The idempotency key must not bypass the regular send error path.
 	provider, _ := NewSMTPProvider(&SMTPConfig{
 		Host: "localhost",
 		Port: 1,

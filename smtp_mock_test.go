@@ -1,12 +1,15 @@
 package provider
 
 import (
+	"bufio"
 	"context"
-	"crypto/tls"
 	"errors"
 	"io"
+	"net"
 	"net/smtp"
+	"strings"
 	"testing"
+	"time"
 )
 
 // testSMTPClient for testing - implements smtpClientInterface
@@ -65,18 +68,91 @@ func (c *testSMTPClient) Close() error {
 	return nil
 }
 
-func TestSMTPProvider_sendPlain_Success(t *testing.T) {
-	// Save original and restore after test
-	origSendMail := smtpSendMail
-	defer func() { smtpSendMail = origSendMail }()
+func mockSMTPPipe(t *testing.T, authSeen chan<- bool) net.Conn {
+	t.Helper()
+	client, server := net.Pipe()
+	go func() {
+		defer func() { _ = server.Close() }()
+		reader := bufio.NewReader(server)
+		writer := bufio.NewWriter(server)
+		writeReply := func(reply string) bool {
+			if _, err := writer.WriteString(reply); err != nil {
+				return false
+			}
+			return writer.Flush() == nil
+		}
+		if !writeReply("220 mock SMTP\r\n") {
+			return
+		}
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			upper := strings.ToUpper(strings.TrimSpace(line))
+			switch {
+			case strings.HasPrefix(upper, "EHLO"):
+				if !writeReply("250-mock\r\n250 AUTH PLAIN\r\n") {
+					return
+				}
+			case strings.HasPrefix(upper, "HELO"):
+				if !writeReply("250 mock\r\n") {
+					return
+				}
+			case strings.HasPrefix(upper, "AUTH PLAIN"):
+				if authSeen != nil {
+					authSeen <- true
+				}
+				if !writeReply("235 authenticated\r\n") {
+					return
+				}
+			case strings.HasPrefix(upper, "MAIL FROM"), strings.HasPrefix(upper, "RCPT TO"):
+				if !writeReply("250 ok\r\n") {
+					return
+				}
+			case upper == "DATA":
+				if !writeReply("354 end with dot\r\n") {
+					return
+				}
+				for {
+					dataLine, readErr := reader.ReadString('\n')
+					if readErr != nil {
+						return
+					}
+					if dataLine == ".\r\n" {
+						break
+					}
+				}
+				if !writeReply("250 queued\r\n") {
+					return
+				}
+			case upper == "QUIT":
+				_ = writeReply("221 bye\r\n")
+				return
+			default:
+				if !writeReply("500 unsupported\r\n") {
+					return
+				}
+			}
+		}
+	}()
+	return client
+}
 
-	// Mock successful send
-	smtpSendMail = func(addr string, a smtp.Auth, from string, to []string, msg []byte) error {
-		return nil
-	}
+func replaceSMTPDial(t *testing.T, fn func(context.Context, string, string, time.Duration) (net.Conn, error)) {
+	t.Helper()
+	original := smtpDialContext
+	smtpDialContext = fn
+	t.Cleanup(func() { smtpDialContext = original })
+}
+
+func TestSMTPProvider_sendPlain_Success(t *testing.T) {
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return mockSMTPPipe(t, nil), nil
+	})
 
 	provider, _ := NewSMTPProvider(&SMTPConfig{
-		Host:        "smtp.example.com",
+		Host:        "localhost",
 		Port:        25,
 		From:        "sender@example.com",
 		UseTLS:      false,
@@ -94,18 +170,13 @@ func TestSMTPProvider_sendPlain_Success(t *testing.T) {
 }
 
 func TestSMTPProvider_sendPlain_WithAuth(t *testing.T) {
-	// Save original and restore after test
-	origSendMail := smtpSendMail
-	defer func() { smtpSendMail = origSendMail }()
-
-	var receivedAuth smtp.Auth
-	smtpSendMail = func(addr string, a smtp.Auth, from string, to []string, msg []byte) error {
-		receivedAuth = a
-		return nil
-	}
+	authSeen := make(chan bool, 1)
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return mockSMTPPipe(t, authSeen), nil
+	})
 
 	provider, _ := NewSMTPProvider(&SMTPConfig{
-		Host:        "smtp.example.com",
+		Host:        "localhost",
 		Port:        25,
 		From:        "sender@example.com",
 		Username:    "user",
@@ -120,20 +191,18 @@ func TestSMTPProvider_sendPlain_WithAuth(t *testing.T) {
 		t.Fatalf("Send() error = %v", err)
 	}
 
-	if receivedAuth == nil {
-		t.Error("Auth should be set when username is provided")
+	select {
+	case <-authSeen:
+	case <-time.After(time.Second):
+		t.Error("Auth should be attempted when username is provided")
 	}
 }
 
 func TestSMTPProvider_sendPlain_Error(t *testing.T) {
-	// Save original and restore after test
-	origSendMail := smtpSendMail
-	defer func() { smtpSendMail = origSendMail }()
-
 	expectedErr := errors.New("connection refused")
-	smtpSendMail = func(addr string, a smtp.Auth, from string, to []string, msg []byte) error {
-		return expectedErr
-	}
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return nil, expectedErr
+	})
 
 	provider, _ := NewSMTPProvider(&SMTPConfig{
 		Host:        "smtp.example.com",
@@ -154,20 +223,9 @@ func TestSMTPProvider_sendPlain_Error(t *testing.T) {
 }
 
 func TestSMTPProvider_sendWithTLS_Success(t *testing.T) {
-	// Save originals and restore after test
-	origTLSDial := tlsDial
-	origNewClient := smtpNewClient
-	defer func() {
-		tlsDial = origTLSDial
-		smtpNewClient = origNewClient
-	}()
-
-	// Mock TLS dial
-	tlsDial = func(network, addr string, config *tls.Config) (*tls.Conn, error) {
-		// Return a mock connection wrapped in tls.Conn is complex
-		// Instead we'll test error path
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("TLS dial failed")
-	}
+	})
 
 	provider, _ := NewSMTPProvider(&SMTPConfig{
 		Host:   "smtp.example.com",
@@ -187,14 +245,9 @@ func TestSMTPProvider_sendWithTLS_Success(t *testing.T) {
 }
 
 func TestSMTPProvider_sendWithStartTLS_Success(t *testing.T) {
-	// Save original and restore after test
-	origDial := smtpDial
-	defer func() { smtpDial = origDial }()
-
-	// Mock dial success but StartTLS will fail since mock client doesn't support it properly
-	smtpDial = func(addr string) (*smtp.Client, error) {
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
-	}
+	})
 
 	provider, _ := NewSMTPProvider(&SMTPConfig{
 		Host:        "smtp.example.com",
