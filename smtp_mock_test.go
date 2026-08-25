@@ -3,8 +3,15 @@ package provider
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/smtp"
 	"strings"
@@ -73,70 +80,145 @@ func mockSMTPPipe(t *testing.T, authSeen chan<- bool) net.Conn {
 	client, server := net.Pipe()
 	go func() {
 		defer func() { _ = server.Close() }()
-		reader := bufio.NewReader(server)
-		writer := bufio.NewWriter(server)
-		writeReply := func(reply string) bool {
-			if _, err := writer.WriteString(reply); err != nil {
-				return false
-			}
-			return writer.Flush() == nil
-		}
-		if !writeReply("220 mock SMTP\r\n") {
-			return
-		}
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				return
-			}
-			upper := strings.ToUpper(strings.TrimSpace(line))
-			switch {
-			case strings.HasPrefix(upper, "EHLO"):
-				if !writeReply("250-mock\r\n250 AUTH PLAIN\r\n") {
-					return
-				}
-			case strings.HasPrefix(upper, "HELO"):
-				if !writeReply("250 mock\r\n") {
-					return
-				}
-			case strings.HasPrefix(upper, "AUTH PLAIN"):
-				if authSeen != nil {
-					authSeen <- true
-				}
-				if !writeReply("235 authenticated\r\n") {
-					return
-				}
-			case strings.HasPrefix(upper, "MAIL FROM"), strings.HasPrefix(upper, "RCPT TO"):
-				if !writeReply("250 ok\r\n") {
-					return
-				}
-			case upper == "DATA":
-				if !writeReply("354 end with dot\r\n") {
-					return
-				}
-				for {
-					dataLine, readErr := reader.ReadString('\n')
-					if readErr != nil {
-						return
-					}
-					if dataLine == ".\r\n" {
-						break
-					}
-				}
-				if !writeReply("250 queued\r\n") {
-					return
-				}
-			case upper == "QUIT":
-				_ = writeReply("221 bye\r\n")
-				return
-			default:
-				if !writeReply("500 unsupported\r\n") {
-					return
-				}
-			}
-		}
+		serveMockSMTP(server, authSeen, nil)
 	}()
 	return client
+}
+
+func mockSMTPTLSPipe(t *testing.T, startTLS bool) net.Conn {
+	t.Helper()
+	client, server := net.Pipe()
+	serverTLS := testServerTLSConfig(t)
+	go func() {
+		defer func() { _ = server.Close() }()
+		if startTLS {
+			serveMockSMTP(server, nil, serverTLS)
+			return
+		}
+		tlsServer := tls.Server(server, serverTLS)
+		if err := tlsServer.Handshake(); err != nil {
+			return
+		}
+		serveMockSMTP(tlsServer, nil, nil)
+	}()
+	return client
+}
+
+func serveMockSMTP(conn net.Conn, authSeen chan<- bool, startTLSConfig *tls.Config) {
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+	writeReply := func(reply string) bool {
+		if _, err := writer.WriteString(reply); err != nil {
+			return false
+		}
+		return writer.Flush() == nil
+	}
+	if !writeReply("220 mock SMTP\r\n") {
+		return
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		upper := strings.ToUpper(strings.TrimSpace(line))
+		switch {
+		case strings.HasPrefix(upper, "EHLO"):
+			if startTLSConfig != nil {
+				if !writeReply("250-mock\r\n250 STARTTLS\r\n") {
+					return
+				}
+				continue
+			}
+			if !writeReply("250-mock\r\n250 AUTH PLAIN\r\n") {
+				return
+			}
+		case strings.HasPrefix(upper, "HELO"):
+			if !writeReply("250 mock\r\n") {
+				return
+			}
+		case upper == "STARTTLS" && startTLSConfig != nil:
+			if !writeReply("220 ready for TLS\r\n") {
+				return
+			}
+			tlsServer := tls.Server(conn, startTLSConfig)
+			if err := tlsServer.Handshake(); err != nil {
+				return
+			}
+			conn = tlsServer
+			reader = bufio.NewReader(conn)
+			writer = bufio.NewWriter(conn)
+			startTLSConfig = nil
+		case strings.HasPrefix(upper, "AUTH PLAIN"):
+			if authSeen != nil {
+				authSeen <- true
+			}
+			if !writeReply("235 authenticated\r\n") {
+				return
+			}
+		case strings.HasPrefix(upper, "MAIL FROM"), strings.HasPrefix(upper, "RCPT TO"):
+			if !writeReply("250 ok\r\n") {
+				return
+			}
+		case upper == "DATA":
+			if !writeReply("354 end with dot\r\n") {
+				return
+			}
+			for {
+				dataLine, readErr := reader.ReadString('\n')
+				if readErr != nil {
+					return
+				}
+				if dataLine == ".\r\n" {
+					break
+				}
+			}
+			if !writeReply("250 queued\r\n") {
+				return
+			}
+		case upper == "QUIT":
+			_ = writeReply("221 bye\r\n")
+			if _, encrypted := conn.(*tls.Conn); !encrypted {
+				return
+			}
+		default:
+			if !writeReply("500 unsupported\r\n") {
+				return
+			}
+		}
+	}
+}
+
+func testServerTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey() error = %v", err)
+	}
+	now := time.Now()
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		DNSNames:     []string{"localhost"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate() error = %v", err)
+	}
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	certificate, err := tls.X509KeyPair(certificatePEM, privateKeyPEM)
+	if err != nil {
+		t.Fatalf("tls.X509KeyPair() error = %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		MinVersion:   tls.VersionTLS12,
+	}
 }
 
 func replaceSMTPDial(t *testing.T, fn func(context.Context, string, string, time.Duration) (net.Conn, error)) {
@@ -144,6 +226,13 @@ func replaceSMTPDial(t *testing.T, fn func(context.Context, string, string, time
 	original := smtpDialContext
 	smtpDialContext = fn
 	t.Cleanup(func() { smtpDialContext = original })
+}
+
+func replaceSMTPNewClient(t *testing.T, fn func(net.Conn, string) (*smtp.Client, error)) {
+	t.Helper()
+	original := smtpNewClient
+	smtpNewClient = fn
+	t.Cleanup(func() { smtpNewClient = original })
 }
 
 func TestSMTPProvider_sendPlain_Success(t *testing.T) {
@@ -222,7 +311,7 @@ func TestSMTPProvider_sendPlain_Error(t *testing.T) {
 	}
 }
 
-func TestSMTPProvider_sendWithTLS_Success(t *testing.T) {
+func TestSMTPProvider_sendWithTLS_DialError(t *testing.T) {
 	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("TLS dial failed")
 	})
@@ -244,7 +333,64 @@ func TestSMTPProvider_sendWithTLS_Success(t *testing.T) {
 	}
 }
 
-func TestSMTPProvider_sendWithStartTLS_Success(t *testing.T) {
+func TestSMTPProvider_sendWithTLS_Success(t *testing.T) {
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return mockSMTPTLSPipe(t, false), nil
+	})
+
+	provider, _ := NewSMTPProvider(&SMTPConfig{
+		Host:          "localhost",
+		Port:          465,
+		From:          "sender@example.com",
+		UseTLS:        true,
+		SkipTLSVerify: true,
+	})
+
+	result, err := provider.Send(context.Background(), NewMessage("recipient@example.com").WithBody("Test"))
+	if err != nil {
+		t.Fatalf("Send() error = %v (cause: %v)", err, errors.Unwrap(err))
+	}
+	if !result.OK {
+		t.Error("Send() result.OK should be true")
+	}
+}
+
+func TestSMTPProvider_sendWithTLS_HandshakeError(t *testing.T) {
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		client, server := net.Pipe()
+		return &deadlineTestConn{Conn: client, closePeer: server}, nil
+	})
+
+	provider, _ := NewSMTPProvider(&SMTPConfig{
+		Host: "localhost", Port: 465, From: "sender@example.com", UseTLS: true,
+	})
+	result, err := provider.Send(context.Background(), NewMessage("recipient@example.com"))
+	if err == nil || !strings.Contains(errors.Unwrap(err).Error(), "TLS handshake failed") {
+		t.Fatalf("Send() error = %v (cause: %v), want TLS handshake failure", err, errors.Unwrap(err))
+	}
+	if result.OK {
+		t.Error("Send() result.OK should be false")
+	}
+}
+
+func TestSMTPProvider_sendWithTLS_ClientCreationError(t *testing.T) {
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return mockSMTPTLSPipe(t, false), nil
+	})
+	replaceSMTPNewClient(t, func(net.Conn, string) (*smtp.Client, error) {
+		return nil, errors.New("client creation failed")
+	})
+
+	provider, _ := NewSMTPProvider(&SMTPConfig{
+		Host: "localhost", Port: 465, From: "sender@example.com", UseTLS: true, SkipTLSVerify: true,
+	})
+	_, err := provider.Send(context.Background(), NewMessage("recipient@example.com"))
+	if err == nil || !strings.Contains(errors.Unwrap(err).Error(), "SMTP client creation failed") {
+		t.Fatalf("Send() error = %v (cause: %v), want client creation failure", err, errors.Unwrap(err))
+	}
+}
+
+func TestSMTPProvider_sendWithStartTLS_DialError(t *testing.T) {
 	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
 	})
@@ -263,6 +409,59 @@ func TestSMTPProvider_sendWithStartTLS_Success(t *testing.T) {
 	}
 	if result.OK {
 		t.Error("Send() result.OK should be false")
+	}
+}
+
+func TestSMTPProvider_sendWithStartTLS_Success(t *testing.T) {
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return mockSMTPTLSPipe(t, true), nil
+	})
+
+	provider, _ := NewSMTPProvider(&SMTPConfig{
+		Host:          "localhost",
+		Port:          587,
+		From:          "sender@example.com",
+		UseStartTLS:   true,
+		SkipTLSVerify: true,
+	})
+
+	result, err := provider.Send(context.Background(), NewMessage("recipient@example.com").WithBody("Test"))
+	if err != nil {
+		t.Fatalf("Send() error = %v (cause: %v)", err, errors.Unwrap(err))
+	}
+	if !result.OK {
+		t.Error("Send() result.OK should be true")
+	}
+}
+
+func TestSMTPProvider_sendWithStartTLS_ClientCreationError(t *testing.T) {
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return mockSMTPPipe(t, nil), nil
+	})
+	replaceSMTPNewClient(t, func(net.Conn, string) (*smtp.Client, error) {
+		return nil, errors.New("client creation failed")
+	})
+
+	provider, _ := NewSMTPProvider(&SMTPConfig{
+		Host: "localhost", Port: 587, From: "sender@example.com", UseStartTLS: true,
+	})
+	_, err := provider.Send(context.Background(), NewMessage("recipient@example.com"))
+	if err == nil || !strings.Contains(errors.Unwrap(err).Error(), "SMTP client creation failed") {
+		t.Fatalf("Send() error = %v (cause: %v), want client creation failure", err, errors.Unwrap(err))
+	}
+}
+
+func TestSMTPProvider_sendWithStartTLS_UpgradeError(t *testing.T) {
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return mockSMTPPipe(t, nil), nil
+	})
+
+	provider, _ := NewSMTPProvider(&SMTPConfig{
+		Host: "localhost", Port: 587, From: "sender@example.com", UseStartTLS: true,
+	})
+	_, err := provider.Send(context.Background(), NewMessage("recipient@example.com"))
+	if err == nil || !strings.Contains(errors.Unwrap(err).Error(), "STARTTLS failed") {
+		t.Fatalf("Send() error = %v (cause: %v), want STARTTLS failure", err, errors.Unwrap(err))
 	}
 }
 
