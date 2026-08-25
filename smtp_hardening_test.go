@@ -9,6 +9,33 @@ import (
 	"time"
 )
 
+type deadlineTestConn struct {
+	net.Conn
+	deadline    time.Time
+	deadlineErr error
+	closed      bool
+	closePeer   net.Conn
+}
+
+func (c *deadlineTestConn) SetDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	if c.deadlineErr != nil {
+		return c.deadlineErr
+	}
+	if err := c.Conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	if c.closePeer != nil {
+		_ = c.closePeer.Close()
+	}
+	return nil
+}
+
+func (c *deadlineTestConn) Close() error {
+	c.closed = true
+	return c.Conn.Close()
+}
+
 func TestSMTPConfig_ValidateRejectsUnsafeValues(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -57,6 +84,7 @@ func TestSMTPProvider_SendRejectsUnsafeHeaders(t *testing.T) {
 		{name: "invalid recipient", msg: NewMessage("not-an-email"), reason: ReasonInvalidDestination},
 		{name: "recipient injection", msg: NewMessage("victim@example.com\r\nBcc: other@example.com"), reason: ReasonInvalidDestination},
 		{name: "subject injection", msg: NewMessage("recipient@example.com").WithSubject("Hello\r\nBcc: other@example.com"), reason: ReasonValidationFailed},
+		{name: "subject invalid UTF-8", msg: NewMessage("recipient@example.com").WithSubject(string([]byte{0xff})), reason: ReasonValidationFailed},
 	}
 
 	for _, tt := range tests {
@@ -72,6 +100,66 @@ func TestSMTPProvider_SendRejectsUnsafeHeaders(t *testing.T) {
 				t.Errorf("Send() reason = %q, want %q", result.Error.Reason, tt.reason)
 			}
 		})
+	}
+}
+
+func TestSMTPProvider_DialUsesEarlierContextDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	connection := &deadlineTestConn{Conn: client}
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return connection, nil
+	})
+
+	provider, err := NewSMTPProvider(&SMTPConfig{
+		Host: "smtp.example.com", Port: 25, From: "sender@example.com", Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewSMTPProvider() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	contextDeadline, _ := ctx.Deadline()
+	_, cleanup, err := provider.dial(ctx, "smtp.example.com:25")
+	if err != nil {
+		t.Fatalf("dial() error = %v", err)
+	}
+	cleanup()
+	if delta := connection.deadline.Sub(contextDeadline); delta < -time.Millisecond || delta > time.Millisecond {
+		t.Errorf("connection deadline = %v, want context deadline %v", connection.deadline, contextDeadline)
+	}
+}
+
+func TestSMTPProvider_DialClosesConnectionWhenSettingDeadlineFails(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	expectedErr := errors.New("deadline unsupported")
+	connection := &deadlineTestConn{Conn: client, deadlineErr: expectedErr}
+	replaceSMTPDial(t, func(context.Context, string, string, time.Duration) (net.Conn, error) {
+		return connection, nil
+	})
+
+	provider, err := NewSMTPProvider(&SMTPConfig{
+		Host: "smtp.example.com", Port: 25, From: "sender@example.com", Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewSMTPProvider() error = %v", err)
+	}
+	_, cleanup, err := provider.dial(context.Background(), "smtp.example.com:25")
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("dial() error = %v, want %v", err, expectedErr)
+	}
+	if cleanup != nil {
+		t.Fatal("dial() cleanup should be nil after deadline failure")
+	}
+	if !connection.closed {
+		t.Fatal("dial() should close connection after deadline failure")
+	}
+}
+
+func TestMessageIDDomainFallback(t *testing.T) {
+	if got := messageIDDomain("invalid-address"); got != "localhost" {
+		t.Errorf("messageIDDomain() = %q, want localhost", got)
 	}
 }
 
