@@ -11,9 +11,8 @@ import (
 
 // countingProvider records how many times Send actually reached the provider.
 type countingProvider struct {
-	sends  int32
-	delay  time.Duration
-	inside sync.WaitGroup
+	sends int32
+	delay time.Duration
 }
 
 func (p *countingProvider) Channel() Channel { return ChannelEmail }
