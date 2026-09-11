@@ -2,7 +2,10 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -26,15 +29,22 @@ var ErrSendInFlight = errors.New("a send for this idempotency key is already in 
 type Reserver interface {
 	// Reserve atomically claims key for ttl.
 	//
-	// It returns claimed=true when this caller now owns the key. When it
-	// returns claimed=false, existing holds the completed result if one has
-	// been recorded, or nil when another caller holds the claim but has not
+	// A non-empty token means this caller now owns the key; it identifies THIS
+	// claim and must be handed back to Abandon. An empty token means the key
+	// was not claimed: existing holds the completed result if one has been
+	// recorded, or nil when another caller holds the claim but has not
 	// finished yet.
-	Reserve(ctx context.Context, key string, ttl time.Duration) (claimed bool, existing *SendResult, err error)
+	Reserve(ctx context.Context, key string, ttl time.Duration) (token string, existing *SendResult, err error)
 
 	// Abandon releases a claim that will never produce a result, so a failed
 	// attempt does not block retries for the whole TTL.
-	Abandon(ctx context.Context, key string) error
+	//
+	// It releases only the claim identified by token. A send that overruns its
+	// reservation TTL lets a second caller claim the same key; without the
+	// token the first caller's late Abandon would delete that second,
+	// still-resultless claim and let a third caller into the provider
+	// concurrently with the second -- the very duplicate this type prevents.
+	Abandon(ctx context.Context, key, token string) error
 }
 
 // IdempotencyStore defines the interface for storing idempotency records
@@ -59,6 +69,9 @@ type idempotencyEntry struct {
 	// result is nil while a send is in flight and set once it completes.
 	result    *SendResult
 	expiresAt time.Time
+	// token identifies the caller holding an as-yet-resultless claim, so a
+	// late Abandon from a previous holder cannot release a newer one.
+	token string
 }
 
 // NewMemoryIdempotencyStore creates a new in-memory idempotency store.
@@ -87,7 +100,12 @@ func (s *MemoryIdempotencyStore) Close() error {
 }
 
 // Reserve implements Reserver.
-func (s *MemoryIdempotencyStore) Reserve(_ context.Context, key string, ttl time.Duration) (bool, *SendResult, error) {
+func (s *MemoryIdempotencyStore) Reserve(_ context.Context, key string, ttl time.Duration) (string, *SendResult, error) {
+	token, err := newClaimToken()
+	if err != nil {
+		return "", nil, err
+	}
+
 	now := time.Now()
 
 	s.mu.Lock()
@@ -95,28 +113,43 @@ func (s *MemoryIdempotencyStore) Reserve(_ context.Context, key string, ttl time
 
 	if entry, ok := s.entries[key]; ok && now.Before(entry.expiresAt) {
 		if entry.result == nil {
-			return false, nil, nil // claimed by someone else, still in flight
+			return "", nil, nil // claimed by someone else, still in flight
 		}
 		// Copy: the stored result is shared by every caller that hits this key.
 		result := *entry.result
-		return false, &result, nil
+		return "", &result, nil
 	}
 
 	// Claim the key with no result yet; Set records the outcome later.
-	s.entries[key] = &idempotencyEntry{expiresAt: now.Add(ttl)}
-	return true, nil, nil
+	s.entries[key] = &idempotencyEntry{expiresAt: now.Add(ttl), token: token}
+	return token, nil, nil
 }
 
 // Abandon implements Reserver.
-func (s *MemoryIdempotencyStore) Abandon(_ context.Context, key string) error {
+func (s *MemoryIdempotencyStore) Abandon(_ context.Context, key, token string) error {
+	if token == "" {
+		return nil
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Only drop a claim that has not recorded a result.
-	if entry, ok := s.entries[key]; ok && entry.result == nil {
+	// Only drop a claim that has not recorded a result AND still belongs to
+	// the caller abandoning it. A send that overran its TTL must not release
+	// the claim a later caller has since taken.
+	if entry, ok := s.entries[key]; ok && entry.result == nil && entry.token == token {
 		delete(s.entries, key)
 	}
 	return nil
+}
+
+// newClaimToken returns an unguessable identifier for one reservation.
+func newClaimToken() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("provider: generating an idempotency claim token: %w", err)
+	}
+	return hex.EncodeToString(buf[:]), nil
 }
 
 // Get retrieves a cached result for the given key
@@ -145,6 +178,8 @@ func (s *MemoryIdempotencyStore) Set(ctx context.Context, key string, result *Se
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// No token: an entry carrying a result is no longer an open claim, and
+	// Abandon must not remove it.
 	s.entries[key] = &idempotencyEntry{
 		result:    result,
 		expiresAt: time.Now().Add(ttl),
@@ -254,11 +289,11 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 		return p.sendUnreserved(ctx, cacheKey, msg)
 	}
 
-	claimed, existing, err := reserver.Reserve(ctx, cacheKey, p.ttl)
+	token, existing, err := reserver.Reserve(ctx, cacheKey, p.ttl)
 	if err != nil {
 		return nil, err
 	}
-	if !claimed {
+	if token == "" {
 		if existing != nil {
 			return existing, nil
 		}
@@ -275,7 +310,7 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 		} else {
 			// No outcome to record. Release the claim so a retry is not
 			// blocked for the whole TTL.
-			_ = reserver.Abandon(ctx, cacheKey)
+			_ = reserver.Abandon(ctx, cacheKey, token)
 		}
 		return result, err
 	}

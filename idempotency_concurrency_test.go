@@ -116,22 +116,74 @@ func TestAbandonReleasesClaim(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	ctx := context.Background()
-	claimed, existing, err := store.Reserve(ctx, "k", time.Minute)
-	if err != nil || !claimed || existing != nil {
-		t.Fatalf("Reserve = (%v, %v, %v), want a fresh claim", claimed, existing, err)
+	token, existing, err := store.Reserve(ctx, "k", time.Minute)
+	if err != nil || token == "" || existing != nil {
+		t.Fatalf("Reserve = (%q, %v, %v), want a fresh claim", token, existing, err)
 	}
 
-	claimed2, existing2, err := store.Reserve(ctx, "k", time.Minute)
-	if err != nil || claimed2 || existing2 != nil {
-		t.Fatalf("second Reserve = (%v, %v, %v), want claimed=false with no result", claimed2, existing2, err)
+	token2, existing2, err := store.Reserve(ctx, "k", time.Minute)
+	if err != nil || token2 != "" || existing2 != nil {
+		t.Fatalf("second Reserve = (%q, %v, %v), want no claim and no result", token2, existing2, err)
 	}
 
-	if err := store.Abandon(ctx, "k"); err != nil {
+	if err := store.Abandon(ctx, "k", token); err != nil {
 		t.Fatalf("Abandon() error = %v", err)
 	}
-	claimed3, _, err := store.Reserve(ctx, "k", time.Minute)
-	if err != nil || !claimed3 {
-		t.Errorf("Reserve after Abandon = (%v, %v), want a fresh claim", claimed3, err)
+	token3, _, err := store.Reserve(ctx, "k", time.Minute)
+	if err != nil || token3 == "" {
+		t.Errorf("Reserve after Abandon = (%q, %v), want a fresh claim", token3, err)
+	}
+}
+
+// TestAbandonOnlyReleasesItsOwnClaim is the regression test for Abandon taking
+// no owner identity. A send that overran its reservation TTL let a second
+// caller claim the same key; the first caller's late Abandon then deleted that
+// second, still-resultless claim, and a third caller walked straight into the
+// provider alongside the second -- two messages for one idempotency key.
+func TestAbandonOnlyReleasesItsOwnClaim(t *testing.T) {
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+
+	// Send A claims the key with a short TTL and overruns it.
+	tokenA, _, err := store.Reserve(ctx, "k", 20*time.Millisecond)
+	if err != nil || tokenA == "" {
+		t.Fatalf("Reserve(A) = (%q, %v), want a claim", tokenA, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	// Send B claims the now-expired key and is still running.
+	tokenB, _, err := store.Reserve(ctx, "k", time.Minute)
+	if err != nil || tokenB == "" {
+		t.Fatalf("Reserve(B) = (%q, %v), want a claim after A's TTL expired", tokenB, err)
+	}
+	if tokenA == tokenB {
+		t.Fatal("two reservations were handed the same token")
+	}
+
+	// A finally fails and abandons. This must not touch B's claim.
+	if err := store.Abandon(ctx, "k", tokenA); err != nil {
+		t.Fatalf("Abandon(A) error = %v", err)
+	}
+
+	tokenC, existing, err := store.Reserve(ctx, "k", time.Minute)
+	if err != nil {
+		t.Fatalf("Reserve(C) error = %v", err)
+	}
+	if tokenC != "" {
+		t.Error("a third caller claimed the key while B still held it -- A's Abandon released someone else's claim")
+	}
+	if existing != nil {
+		t.Errorf("Reserve(C) returned a result %v, want none while B is in flight", existing)
+	}
+
+	// B can still release its own claim.
+	if err := store.Abandon(ctx, "k", tokenB); err != nil {
+		t.Fatalf("Abandon(B) error = %v", err)
+	}
+	if tokenD, _, err := store.Reserve(ctx, "k", time.Minute); err != nil || tokenD == "" {
+		t.Errorf("Reserve after B abandoned = (%q, %v), want a fresh claim", tokenD, err)
 	}
 }
 
