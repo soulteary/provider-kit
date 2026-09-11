@@ -144,13 +144,16 @@ func TestIdempotentProvider_Send_GetError(t *testing.T) {
 		WithBody("Test").
 		WithIdempotencyKey("error-key")
 
-	// Should proceed with send even if cache Get fails
+	// A store read failure must NOT be treated as a cache miss. Doing so
+	// silently switched idempotency off exactly when the store was unhealthy,
+	// and sent the message again. Nothing has been sent yet at this point, so
+	// refusing is safe; the caller can retry once the store recovers.
 	result, err := provider.Send(context.Background(), msg)
-	if err != nil {
-		t.Fatalf("Send() error = %v", err)
+	if err == nil {
+		t.Fatal("Send() returned nil error on a store read failure; idempotency was silently bypassed")
 	}
-	if !result.OK {
-		t.Error("Send should succeed even if cache Get fails")
+	if result != nil {
+		t.Errorf("Send() returned a result %v despite not sending", result)
 	}
 }
 
