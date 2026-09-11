@@ -199,3 +199,59 @@ func TestStoreCloseStopsCleanupGoroutine(t *testing.T) {
 		t.Errorf("second Close() error = %v", err)
 	}
 }
+
+// --- Codex review round 2 (PR #6) ---
+
+// TestCachedResultIsDeeplyCopied is the regression test for copying only the
+// outer struct. The result constructors allocate Metadata, so every caller
+// that hit a cached key shared that MAP: one of them adding metadata mutated
+// what the others saw, and raced with them while doing it.
+func TestCachedResultIsDeeplyCopied(t *testing.T) {
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	original := &SendResult{
+		OK:       true,
+		Provider: "p",
+		Metadata: map[string]string{"attempt": "1"},
+		Error:    &ProviderError{Message: "none"},
+	}
+	if err := store.Set(ctx, "k", original, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	first, ok, err := store.Get(ctx, "k")
+	if err != nil || !ok {
+		t.Fatalf("Get = (%v, %v, %v)", first, ok, err)
+	}
+
+	// A caller mutating what it was handed must not affect anyone else.
+	first.Metadata["attempt"] = "999"
+	first.Metadata["injected"] = "yes"
+	first.Error.Message = "tampered"
+
+	second, ok, err := store.Get(ctx, "k")
+	if err != nil || !ok {
+		t.Fatalf("second Get = (%v, %v, %v)", second, ok, err)
+	}
+	if got := second.Metadata["attempt"]; got != "1" {
+		t.Errorf("Metadata[attempt] = %q after another caller mutated its copy, want 1", got)
+	}
+	if _, injected := second.Metadata["injected"]; injected {
+		t.Error("a key added by another caller leaked into the cached result")
+	}
+	if second.Error.Message != "none" {
+		t.Errorf("Error.Message = %q, want none: the error pointer is shared", second.Error.Message)
+	}
+
+	// Reserve returns the completed result on the same path.
+	token, existing, err := store.Reserve(ctx, "k", time.Minute)
+	if err != nil || token != "" || existing == nil {
+		t.Fatalf("Reserve = (%q, %v, %v), want the recorded result", token, existing, err)
+	}
+	existing.Metadata["attempt"] = "777"
+	if third, _, _ := store.Get(ctx, "k"); third.Metadata["attempt"] != "1" {
+		t.Errorf("Metadata[attempt] = %q after mutating Reserve's result, want 1", third.Metadata["attempt"])
+	}
+}

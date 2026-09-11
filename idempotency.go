@@ -116,8 +116,7 @@ func (s *MemoryIdempotencyStore) Reserve(_ context.Context, key string, ttl time
 			return "", nil, nil // claimed by someone else, still in flight
 		}
 		// Copy: the stored result is shared by every caller that hits this key.
-		result := *entry.result
-		return "", &result, nil
+		return "", cloneSendResult(entry.result), nil
 	}
 
 	// Claim the key with no result yet; Set records the outcome later.
@@ -141,6 +140,31 @@ func (s *MemoryIdempotencyStore) Abandon(_ context.Context, key, token string) e
 		delete(s.entries, key)
 	}
 	return nil
+}
+
+// cloneSendResult returns an independent copy of a stored result.
+//
+// Copying the struct alone shares the Metadata MAP and the Error pointer with
+// every other caller that hits this key, so one caller adding metadata -- the
+// result constructors allocate that map, and WithMetadata writes into it --
+// mutated what the others saw, and raced with them while doing it.
+func cloneSendResult(src *SendResult) *SendResult {
+	if src == nil {
+		return nil
+	}
+
+	out := *src
+	if src.Metadata != nil {
+		out.Metadata = make(map[string]string, len(src.Metadata))
+		for k, v := range src.Metadata {
+			out.Metadata[k] = v
+		}
+	}
+	if src.Error != nil {
+		errCopy := *src.Error
+		out.Error = &errCopy
+	}
+	return &out
 }
 
 // newClaimToken returns an unguessable identifier for one reservation.
@@ -169,8 +193,7 @@ func (s *MemoryIdempotencyStore) Get(ctx context.Context, key string) (*SendResu
 	// Hand back a copy: the stored result is shared by every caller that hits
 	// this key, so returning the pointer let one caller mutate what the others
 	// see.
-	result := *entry.result
-	return &result, true, nil
+	return cloneSendResult(entry.result), true, nil
 }
 
 // Set stores a result with the given key and TTL
