@@ -45,7 +45,25 @@ type Reserver interface {
 	// still-resultless claim and let a third caller into the provider
 	// concurrently with the second -- the very duplicate this type prevents.
 	Abandon(ctx context.Context, key, token string) error
+
+	// Finalize records the outcome of the claim identified by token.
+	//
+	// Like Abandon it is fenced by the token, and for the same reason. Set
+	// takes no token, so a send that overran its reservation TTL could
+	// complete after a second caller had claimed the same key and replace
+	// that caller's entry -- overwriting a completed result, or erasing an
+	// in-flight claim -- leaving two callers with different answers for one
+	// idempotency key. A write whose claim has been superseded must be
+	// dropped, not applied.
+	//
+	// The result passed in belongs to the store; the caller does not retain
+	// it.
+	Finalize(ctx context.Context, key, token string, result *SendResult, ttl time.Duration) error
 }
+
+// ErrClaimSuperseded is returned by Finalize when the claim it was given has
+// since been taken over, so the outcome was not recorded.
+var ErrClaimSuperseded = errors.New("idempotency claim superseded")
 
 // IdempotencyStore defines the interface for storing idempotency records
 type IdempotencyStore interface {
@@ -138,6 +156,26 @@ func (s *MemoryIdempotencyStore) Abandon(_ context.Context, key, token string) e
 	// the claim a later caller has since taken.
 	if entry, ok := s.entries[key]; ok && entry.result == nil && entry.token == token {
 		delete(s.entries, key)
+	}
+	return nil
+}
+
+// Finalize implements Reserver.
+func (s *MemoryIdempotencyStore) Finalize(_ context.Context, key, token string, result *SendResult, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if entry, ok := s.entries[key]; ok && entry.token != token {
+		// Someone else holds this key now, or has already recorded an outcome
+		// for it. Theirs is the current answer.
+		return ErrClaimSuperseded
+	}
+
+	// No entry at all means the claim expired and nothing replaced it. A send
+	// did go out, so recording its outcome is still the best answer available.
+	s.entries[key] = &idempotencyEntry{
+		result:    result,
+		expiresAt: time.Now().Add(ttl),
 	}
 	return nil
 }
@@ -329,11 +367,19 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 	if err != nil {
 		if result != nil {
 			// A definite outcome: record it so retries see the same answer.
-			_ = p.store.Set(ctx, cacheKey, result, p.ttl)
+			_ = reserver.Finalize(ctx, cacheKey, token, cloneSendResult(result), p.ttl)
 		} else {
 			// No outcome to record. Release the claim so a retry is not
 			// blocked for the whole TTL.
-			_ = reserver.Abandon(ctx, cacheKey, token)
+			//
+			// On a cleanup context, because the usual reason there is no
+			// result is that ctx was cancelled or timed out -- and a
+			// context-aware store would reject the cleanup on that very ctx,
+			// leaving the reservation standing and every retry answered with
+			// ErrSendInFlight until the TTL elapsed.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonTimeout)
+			_ = reserver.Abandon(cleanupCtx, cacheKey, token)
+			cancel()
 		}
 		return result, err
 	}
@@ -343,10 +389,18 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 	// caller that retries on error into sending it a second time. The cost is
 	// that a later retry is not deduplicated, which is strictly better than
 	// duplicating a send that already succeeded.
-	_ = p.store.Set(ctx, cacheKey, result, p.ttl)
+	//
+	// A CLONE is handed over, and the caller keeps the original. Passing the
+	// provider's own pointer let the caller go on mutating what the store had
+	// cached -- WithMetadata writes into the Metadata map the result
+	// constructors allocate -- and raced with readers cloning that same map.
+	_ = reserver.Finalize(ctx, cacheKey, token, cloneSendResult(result), p.ttl)
 
 	return result, nil
 }
+
+// abandonTimeout bounds the cleanup release of a reservation.
+const abandonTimeout = 5 * time.Second
 
 // sendUnreserved is the legacy check-then-act path, used when the configured
 // store does not implement Reserver.
@@ -362,14 +416,16 @@ func (p *IdempotentProvider) sendUnreserved(ctx context.Context, cacheKey string
 	result, err = p.provider.Send(ctx, msg)
 	if err != nil {
 		if result != nil {
-			_ = p.store.Set(ctx, cacheKey, result, p.ttl)
+			_ = p.store.Set(ctx, cacheKey, cloneSendResult(result), p.ttl)
 		}
 		return result, err
 	}
 
 	// See Send: a failure to record an outcome that already happened must not
 	// be reported as a send failure.
-	_ = p.store.Set(ctx, cacheKey, result, p.ttl)
+	// A clone, as in sendWithReservation: the caller keeps the original and
+	// must not be able to mutate what the store cached.
+	_ = p.store.Set(ctx, cacheKey, cloneSendResult(result), p.ttl)
 	return result, nil
 }
 

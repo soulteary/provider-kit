@@ -255,3 +255,102 @@ func TestCachedResultIsDeeplyCopied(t *testing.T) {
 		t.Errorf("Metadata[attempt] = %q after mutating Reserve's result, want 1", third.Metadata["attempt"])
 	}
 }
+
+// TestFinalizeOnlyRecordsItsOwnClaim is the regression test for recording an
+// outcome with Set, which takes no token. A send that overran its reservation
+// TTL could complete after a second caller had claimed the same key and
+// replace that caller's entry -- overwriting a completed result, or erasing an
+// in-flight claim -- so one idempotency key produced two different answers.
+func TestFinalizeOnlyRecordsItsOwnClaim(t *testing.T) {
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+
+	// A claims with a short TTL and overruns it.
+	tokenA, _, err := store.Reserve(ctx, "k", 20*time.Millisecond)
+	if err != nil || tokenA == "" {
+		t.Fatalf("Reserve(A) = (%q, %v), want a claim", tokenA, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	// B claims the expired key and completes.
+	tokenB, _, err := store.Reserve(ctx, "k", time.Minute)
+	if err != nil || tokenB == "" {
+		t.Fatalf("Reserve(B) = (%q, %v), want a claim", tokenB, err)
+	}
+	if err := store.Finalize(ctx, "k", tokenB, &SendResult{OK: true, Provider: "B"}, time.Minute); err != nil {
+		t.Fatalf("Finalize(B) error = %v", err)
+	}
+
+	// A finally completes. Its claim is long gone; B's answer must stand.
+	err = store.Finalize(ctx, "k", tokenA, &SendResult{OK: true, Provider: "A"}, time.Minute)
+	if !errors.Is(err, ErrClaimSuperseded) {
+		t.Errorf("Finalize(A) error = %v, want ErrClaimSuperseded", err)
+	}
+
+	got, found, err := store.Get(ctx, "k")
+	if err != nil || !found {
+		t.Fatalf("Get = (%v, %v, %v), want B's recorded result", got, found, err)
+	}
+	if got.Provider != "B" {
+		t.Errorf("recorded provider = %q, want B -- A's late Finalize overwrote it", got.Provider)
+	}
+
+	// And an in-flight claim must not be erased either.
+	store2 := NewMemoryIdempotencyStore()
+	defer func() { _ = store2.Close() }()
+	tokenX, _, _ := store2.Reserve(ctx, "j", 20*time.Millisecond)
+	time.Sleep(40 * time.Millisecond)
+	tokenY, _, _ := store2.Reserve(ctx, "j", time.Minute)
+	if err := store2.Finalize(ctx, "j", tokenX, &SendResult{OK: true, Provider: "X"}, time.Minute); !errors.Is(err, ErrClaimSuperseded) {
+		t.Errorf("Finalize over an in-flight claim = %v, want ErrClaimSuperseded", err)
+	}
+	if _, existing, _ := store2.Reserve(ctx, "j", time.Minute); existing != nil {
+		t.Error("a late Finalize published a result over a claim that was still in flight")
+	}
+	_ = store2.Abandon(ctx, "j", tokenY)
+}
+
+// TestStoredResultIsDetachedFromTheCaller is the regression test for handing
+// the store the provider's own *SendResult and returning that same pointer.
+// The caller could then mutate what was cached -- WithMetadata writes into the
+// Metadata map the result constructors allocate -- and raced with readers
+// cloning that same map.
+func TestStoredResultIsDetachedFromTheCaller(t *testing.T) {
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	p := NewIdempotentProvider(&metadataProvider{}, &IdempotencyConfig{Store: store, TTL: time.Minute})
+	msg := &Message{To: "a@example.org", IdempotencyKey: "k"}
+
+	first, err := p.Send(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The caller mutates the result it was handed.
+	first.Metadata["tampered"] = "yes"
+	first.Provider = "tampered"
+
+	second, err := p.Send(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := second.Metadata["tampered"]; ok {
+		t.Error("a caller's mutation reached the cached result")
+	}
+	if second.Provider != "original" {
+		t.Errorf("cached provider = %q, want original", second.Provider)
+	}
+}
+
+// metadataProvider returns a result carrying a populated Metadata map.
+type metadataProvider struct{}
+
+func (metadataProvider) Channel() Channel { return ChannelEmail }
+func (metadataProvider) Name() string     { return "metadata" }
+func (metadataProvider) Validate() error  { return nil }
+func (metadataProvider) Send(_ context.Context, _ *Message) (*SendResult, error) {
+	return &SendResult{OK: true, Provider: "original", Metadata: map[string]string{"id": "1"}}, nil
+}
