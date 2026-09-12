@@ -266,6 +266,16 @@ func (s *MemoryIdempotencyStore) Set(ctx context.Context, key string, result *Se
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if result == nil {
+		// The same invariant Finalize keeps: a nil outcome is never RECORDED.
+		// Storing it left an entry that Get read as a miss but Reserve read as
+		// an open claim -- with no token, so nothing could ever release it --
+		// and every send for the key was answered ErrSendInFlight until the
+		// TTL elapsed.
+		delete(s.entries, key)
+		return nil
+	}
+
 	// No token: an entry carrying a result is no longer an open claim, and
 	// Abandon must not remove it.
 	s.entries[key] = &idempotencyEntry{

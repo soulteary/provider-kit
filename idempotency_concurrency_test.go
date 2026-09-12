@@ -562,3 +562,46 @@ func TestFinalizeWithNilReleasesTheClaim(t *testing.T) {
 		t.Errorf("recorded outcome after a tokenless Finalize = (%v, %v, %v)", got, ok, err)
 	}
 }
+
+// --- Codex review round 7 (PR #6) ---
+
+// TestSetWithNilDoesNotCreateAClaim: Set is the PUBLIC IdempotencyStore path,
+// so the "a nil outcome is never recorded" invariant has to hold there too.
+//
+// Storing it left an entry Get read as a miss but Reserve read as an open
+// claim -- and with no token, nothing could ever release it, so every send for
+// that key was answered ErrSendInFlight until the TTL elapsed.
+func TestSetWithNilDoesNotCreateAClaim(t *testing.T) {
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+
+	if err := store.Set(ctx, "k", nil, time.Hour); err != nil {
+		t.Fatalf("Set(nil) = %v", err)
+	}
+
+	token, existing, err := store.Reserve(ctx, "k", time.Hour)
+	if err != nil || existing != nil {
+		t.Fatalf("Reserve after Set(nil) = (%q, %v, %v)", token, existing, err)
+	}
+	if token == "" {
+		t.Fatal("Set(nil) left the key reading as claimed by somebody else")
+	}
+
+	// And it must clear a previously recorded outcome rather than shadow it
+	// with an unreleasable claim.
+	if err := store.Finalize(ctx, "k", token, &SendResult{OK: true, Provider: "p"}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(ctx, "k", nil, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.Get(ctx, "k"); err != nil || ok {
+		t.Errorf("Get after Set(nil) = (ok=%v, err=%v), want a miss", ok, err)
+	}
+	next, existing, err := store.Reserve(ctx, "k", time.Hour)
+	if err != nil || next == "" || existing != nil {
+		t.Errorf("Reserve after Set(nil) over a result = (%q, %v, %v), want a fresh claim", next, existing, err)
+	}
+}
