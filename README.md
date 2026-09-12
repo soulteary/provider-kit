@@ -91,22 +91,93 @@ registry.Register(retryProvider)
 ```go
 import provider "github.com/soulteary/provider-kit"
 
-// Wrap provider with idempotency
+store := provider.NewMemoryIdempotencyStore()
+defer store.Close() // stops the cleanup goroutine
+
 idempotentProvider := provider.NewIdempotentProvider(smtpProvider, &provider.IdempotencyConfig{
-    Store: provider.NewMemoryIdempotencyStore(),
+    Store: store,
     TTL:   5 * time.Minute,
 })
 
 registry.Register(idempotentProvider)
 
-// Send with idempotency key
 msg := provider.NewMessage("recipient@example.com").
     WithBody("Important message").
     WithIdempotencyKey("unique-key-123")
 
-// Second send with same key will return cached result
-result, _ := registry.Send(ctx, provider.ChannelEmail, msg)
+result, err := registry.Send(ctx, provider.ChannelEmail, msg)
 ```
+
+A second send with the same key returns the recorded result instead of sending
+again. `WrapWithIdempotency(provider, store, ttl)` is the shorthand.
+
+#### Concurrency
+
+Two callers can present the same idempotency key at the same time, so the claim
+has to be atomic. A store that implements `Reserver` gets that:
+
+```go
+type Reserver interface {
+    // Reserve claims key atomically and returns any already-recorded result
+    // in the same operation. The token identifies this claim.
+    Reserve(ctx context.Context, key string, ttl time.Duration) (string, *SendResult, error)
+    // Finalize records the outcome against a claim.
+    Finalize(ctx context.Context, key, token string, result *SendResult, ttl time.Duration) error
+    // Abandon releases a claim that will never produce a result.
+    Abandon(ctx context.Context, key, token string) error
+}
+```
+
+`MemoryIdempotencyStore` implements it. For Redis, `Reserve` is
+`SET key value NX PX ttl`.
+
+A store that implements only `IdempotencyStore` still works, through a
+check-then-act path — `Get`, send, `Set`. **That path does not hold under
+concurrency**: two requests with the same key both miss, both call the provider,
+and two messages go out. The window is as wide as the provider call.
+
+Handle the concurrent case:
+
+```go
+result, err := registry.Send(ctx, provider.ChannelEmail, msg)
+switch {
+case errors.Is(err, provider.ErrSendInFlight):
+    // Another caller holds the claim and has not recorded a result yet.
+    // Retry shortly; do not send a second message.
+case errors.Is(err, provider.ErrClaimSuperseded):
+    // This claim was taken over. Re-read the outcome rather than resending.
+case err != nil:
+    return err
+}
+```
+
+#### What is and is not reported
+
+- **A store read failure before sending is returned.** Nothing has been sent at
+  that point, so refusing is safe and you can retry. Previously a store error was
+  treated as a cache miss, so an unavailable store silently switched idempotency
+  off and the message went out again with nothing reported.
+- **A failure to *record* the outcome is deliberately swallowed.** The message has
+  already gone out; reporting an error there would push a caller that retries on
+  error into sending it a second time. The cost is a later retry that is not
+  deduplicated, which is strictly better than duplicating a send that succeeded.
+- **A send that fails without producing a result abandons the claim**, so a retry
+  is not blocked for the whole TTL.
+
+#### Memory store caveats
+
+`MemoryIdempotencyStore` deduplicates **within one process only**. Multiple
+instances behind a load balancer each keep their own map, so the same key can send
+once per instance — use a shared store (Redis) for a multi-instance deployment.
+
+Call `Close()` when you are done with a store. It stops the cleanup goroutine,
+which otherwise runs for the life of the process and keeps the store and all its
+entries reachable.
+
+`Get` and `Reserve` return a **copy** of the stored result, so one caller mutating
+what it got back does not change what other callers see.
+
+### HTTP API Provider
 
 ### HTTP API Provider
 
@@ -309,9 +380,46 @@ go test -coverprofile=coverage.out ./...
 go tool cover -func=coverage.out
 ```
 
+## Upgrade Notes (v1.7.0)
+
+One interface, two sentinels and one method were added; nothing was removed.
+Idempotent sending refuses in cases where it previously sent.
+
+- **A store read failure now fails the send.** The check was
+  `if result, found, err := p.store.Get(...); err == nil && found`, so a store
+  error was indistinguishable from a cache miss: when the store was unavailable,
+  **idempotency silently switched off and the message was sent again**, with
+  nothing reported. Nothing has been sent when that read fails, so refusing is
+  safe — handle the error and retry.
+- **A concurrent caller gets `ErrSendInFlight` instead of a second send.**
+  `IdempotentProvider.Send` was a check-then-act, so two requests carrying the
+  same key both missed, both called the provider, and two messages went out — the
+  case idempotency exists to prevent. **Add handling for `ErrSendInFlight` and
+  `ErrClaimSuperseded`** to any caller that can present the same key twice
+  concurrently.
+- **`Reserver` is new.** A store implementing it claims a key atomically and
+  returns any recorded result in the same operation. `MemoryIdempotencyStore`
+  implements it. A store implementing only `IdempotencyStore` keeps the old
+  check-then-act path, which does not hold under concurrency — if you wrote a
+  custom store, implementing `Reserver` is what makes it safe.
+- **`MemoryIdempotencyStore.Close()` is new, and you should call it.** The store
+  started a cleanup goroutine with no way to stop it, so **every store ever created
+  leaked a goroutine**, and that goroutine kept the store and its entries
+  reachable.
+- **`Get` and `Reserve` return a copy.** `Get` returned the stored `*SendResult`
+  directly, shared by every caller that hit the key, so one caller mutating it
+  changed what the others saw.
+- **A failed send abandons its claim**, so a retry is not blocked for the whole
+  TTL.
+- **Requirements said Go 1.26**; `go.mod` requires `1.27.0`.
+
+Unchanged on purpose: a failure to *record* an outcome is still swallowed, because
+the message has already been sent and surfacing an error there would make a
+retry-on-error caller send it twice.
+
 ## Requirements
 
-- Go 1.26 or later
+- **Go 1.27+** (`go.mod` declares `go 1.27.0`)
 
 ## License
 

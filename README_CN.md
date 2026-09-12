@@ -91,22 +91,87 @@ registry.Register(retryProvider)
 ```go
 import provider "github.com/soulteary/provider-kit"
 
-// 用幂等性包装 Provider
+store := provider.NewMemoryIdempotencyStore()
+defer store.Close() // 停掉清理 goroutine
+
 idempotentProvider := provider.NewIdempotentProvider(smtpProvider, &provider.IdempotencyConfig{
-    Store: provider.NewMemoryIdempotencyStore(),
+    Store: store,
     TTL:   5 * time.Minute,
 })
 
 registry.Register(idempotentProvider)
 
-// 带幂等键发送
 msg := provider.NewMessage("recipient@example.com").
-    WithBody("重要消息").
+    WithBody("Important message").
     WithIdempotencyKey("unique-key-123")
 
-// 相同键的第二次发送将返回缓存结果
-result, _ := registry.Send(ctx, provider.ChannelEmail, msg)
+result, err := registry.Send(ctx, provider.ChannelEmail, msg)
 ```
+
+用同一个键第二次发送会返回已记录的结果，而不是再发一次。
+`WrapWithIdempotency(provider, store, ttl)` 是简写形式。
+
+#### 并发
+
+两个调用方可能同时带着同一个幂等键进来，所以"占位"必须是原子的。实现了 `Reserver`
+的存储就具备这个能力：
+
+```go
+type Reserver interface {
+    // Reserve 原子地占下 key，并在同一次操作中返回任何已记录的结果。
+    // token 标识这一次占位。
+    Reserve(ctx context.Context, key string, ttl time.Duration) (string, *SendResult, error)
+    // Finalize 把结果记录到某次占位上。
+    Finalize(ctx context.Context, key, token string, result *SendResult, ttl time.Duration) error
+    // Abandon 释放一次永远不会产出结果的占位。
+    Abandon(ctx context.Context, key, token string) error
+}
+```
+
+`MemoryIdempotencyStore` 实现了它。对 Redis 来说，`Reserve` 就是
+`SET key value NX PX ttl`。
+
+只实现了 `IdempotencyStore` 的存储仍然可用，走的是"先查后做"的路径——`Get`、发送、
+`Set`。**那条路径在并发下不成立**：两个带同一个键的请求都查不到，都调用 provider，
+于是发出两条消息。这个窗口和 provider 调用本身一样宽。
+
+请处理并发情形：
+
+```go
+result, err := registry.Send(ctx, provider.ChannelEmail, msg)
+switch {
+case errors.Is(err, provider.ErrSendInFlight):
+    // 另一个调用方持有占位，且还没记录结果。
+    // 稍后重试；不要再发第二条消息。
+case errors.Is(err, provider.ErrClaimSuperseded):
+    // 这次占位被接管了。请重新读取结果，而不是重发。
+case err != nil:
+    return err
+}
+```
+
+#### 什么会上报、什么不会
+
+- **发送之前的存储读取失败会被返回。** 在那个时刻还什么都没发出去，所以拒绝是安全的，
+  你可以重试。此前存储错误被当作缓存未命中，于是存储不可用时幂等性会静默关闭、消息
+  再发一次，而且什么都不上报。
+- **记录结果失败是故意被吞掉的。** 消息已经发出去了；在那里报错会把"遇错就重试"的调用
+  方推向再发一次。代价是后续某次重试没有被去重，这严格优于把一次已成功的发送变成重复
+  发送。
+- **发送失败且没有产出结果时会放弃占位**，这样重试不会被整个 TTL 挡住。
+
+#### 内存存储的注意事项
+
+`MemoryIdempotencyStore` **只在单个进程内**去重。负载均衡后面的多个实例各自持有自己的
+map，于是同一个键可能每个实例各发一次——多实例部署请使用共享存储（Redis）。
+
+用完存储请调用 `Close()`。它会停掉清理 goroutine，否则该 goroutine 会在进程的整个生命
+周期里一直运行，并让存储及其所有条目保持可达。
+
+`Get` 和 `Reserve` 返回的是存储结果的**副本**，因此一个调用方修改拿到的对象不会改变其他
+调用方看到的内容。
+
+### HTTP API Provider
 
 ### HTTP API Provider
 
@@ -309,9 +374,36 @@ go test -coverprofile=coverage.out ./...
 go tool cover -func=coverage.out
 ```
 
+## 升级说明（v1.7.0）
+
+新增一个接口、两个哨兵错误和一个方法，没有删除任何东西。幂等发送在一些此前会发送的情形
+下改为拒绝。
+
+- **存储读取失败现在会让发送失败。** 此前的判断是
+  `if result, found, err := p.store.Get(...); err == nil && found`，于是存储错误与缓存
+  未命中无法区分：存储不可用时，**幂等性静默关闭、消息被再发一次**，而且什么都不上报。
+  那次读取失败时还什么都没发出去，所以拒绝是安全的——请处理这个错误并重试。
+- **并发调用方会得到 `ErrSendInFlight`，而不是再发一次。**
+  `IdempotentProvider.Send` 此前是"先查后做"，于是两个带同一个键的请求都查不到、都调用
+  provider，发出两条消息——正是幂等性要防的那件事。**请为任何可能并发带上同一个键的调用
+  方加上 `ErrSendInFlight` 和 `ErrClaimSuperseded` 的处理。**
+- **新增 `Reserver`。** 实现它的存储会原子地占下键，并在同一次操作中返回已记录的结果。
+  `MemoryIdempotencyStore` 已实现。只实现 `IdempotencyStore` 的存储保留旧的"先查后做"
+  路径，它在并发下不成立——如果你写了自定义存储，实现 `Reserver` 才能让它变安全。
+- **新增 `MemoryIdempotencyStore.Close()`，请记得调用。** 该存储此前启动了一个无法停止
+  的清理 goroutine，于是**每个创建过的存储都会泄漏一个 goroutine**，而这个 goroutine
+  还让存储及其条目保持可达。
+- **`Get` 和 `Reserve` 返回副本。** `Get` 此前直接返回存储的 `*SendResult`，被每个命中
+  该键的调用方共享，于是一个调用方修改它就改变了其他调用方看到的内容。
+- **发送失败会放弃占位**，这样重试不会被整个 TTL 挡住。
+- **环境要求里写的是 Go 1.26**；`go.mod` 需要 `1.27.0`。
+
+有意保持不变：记录结果失败仍然被吞掉，因为消息已经发出去了，在那里暴露错误会让
+"遇错就重试"的调用方把它发两次。
+
 ## 环境要求
 
-- Go 1.26 或更高版本
+- **Go 1.27+**（`go.mod` 声明 `go 1.27.0`）
 
 ## 许可证
 
