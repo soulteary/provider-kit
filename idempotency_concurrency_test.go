@@ -605,3 +605,74 @@ func TestSetWithNilDoesNotCreateAClaim(t *testing.T) {
 		t.Errorf("Reserve after Set(nil) over a result = (%q, %v, %v), want a fresh claim", next, existing, err)
 	}
 }
+
+// --- Codex review round 8 (PR #6) ---
+
+// TestSetWithNilDoesNotReleaseAnActiveClaim is the regression test for the
+// round-7 fix deleting unconditionally.
+//
+// Clearing a nil outcome is right for a COMPLETED entry, but an entry with no
+// result is an active claim held by a sender that is still running. Set
+// carries no token, so deleting that released a claim it did not own: the next
+// Reserve handed out a second token and the message went out twice -- the
+// duplicate this type exists to prevent, introduced by the fix for a
+// less-serious bug.
+func TestSetWithNilDoesNotReleaseAnActiveClaim(t *testing.T) {
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+
+	token, _, err := store.Reserve(ctx, "k", time.Hour)
+	if err != nil || token == "" {
+		t.Fatalf("Reserve = (%q, %v)", token, err)
+	}
+
+	if err := store.Set(ctx, "k", nil, time.Hour); err != nil {
+		t.Fatalf("Set(nil) = %v", err)
+	}
+
+	// The claim must still be held: a second caller gets no token.
+	second, existing, err := store.Reserve(ctx, "k", time.Hour)
+	if err != nil {
+		t.Fatalf("second Reserve error = %v", err)
+	}
+	if second != "" {
+		t.Error("Set(nil) released an in-flight claim; two senders now hold the same idempotency key")
+	}
+	if existing != nil {
+		t.Errorf("second Reserve returned a result %+v, want the claim still in flight", existing)
+	}
+
+	// The original holder can still finalize, and its outcome is what sticks.
+	if err := store.Finalize(ctx, "k", token, &SendResult{OK: true, Provider: "p"}, time.Hour); err != nil {
+		t.Fatalf("Finalize by the original holder = %v", err)
+	}
+	got, ok, err := store.Get(ctx, "k")
+	if err != nil || !ok || got == nil || got.Provider != "p" {
+		t.Errorf("Get = (%v, %v, %v), want the original holder's outcome", got, ok, err)
+	}
+}
+
+// TestSetWithNilStillClearsACompletedEntry keeps the round-7 behaviour that
+// this guard must not undo.
+func TestSetWithNilStillClearsACompletedEntry(t *testing.T) {
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+
+	if err := store.Set(ctx, "k", &SendResult{OK: true, Provider: "p"}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(ctx, "k", nil, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.Get(ctx, "k"); err != nil || ok {
+		t.Errorf("Get after Set(nil) over a result = (ok=%v, err=%v), want a miss", ok, err)
+	}
+	next, existing, err := store.Reserve(ctx, "k", time.Hour)
+	if err != nil || next == "" || existing != nil {
+		t.Errorf("Reserve = (%q, %v, %v), want a fresh claim", next, existing, err)
+	}
+}

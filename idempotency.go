@@ -272,7 +272,16 @@ func (s *MemoryIdempotencyStore) Set(ctx context.Context, key string, result *Se
 		// an open claim -- with no token, so nothing could ever release it --
 		// and every send for the key was answered ErrSendInFlight until the
 		// TTL elapsed.
-		delete(s.entries, key)
+		//
+		// Only a COMPLETED entry is cleared. An entry with no result is an
+		// active claim held by a sender that is still running, and Set carries
+		// no token, so deleting it would release a claim it does not own: the
+		// next Reserve would hand out a second token and the message would go
+		// out twice. That is the duplicate this whole type exists to prevent,
+		// and it is the worse failure of the two.
+		if entry, ok := s.entries[key]; ok && entry.result != nil {
+			delete(s.entries, key)
+		}
 		return nil
 	}
 
