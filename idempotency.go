@@ -58,6 +58,11 @@ type Reserver interface {
 	//
 	// The result passed in belongs to the store; the caller does not retain
 	// it.
+	//
+	// A nil result records nothing: it RELEASES the claim, so the next caller
+	// is let through immediately. An implementation must not store it as an
+	// outcome -- Reserve reports a recorded outcome by returning it, and a nil
+	// one is indistinguishable from the claim still being in flight.
 	Finalize(ctx context.Context, key, token string, result *SendResult, ttl time.Duration) error
 }
 
@@ -85,6 +90,11 @@ type MemoryIdempotencyStore struct {
 
 type idempotencyEntry struct {
 	// result is nil while a send is in flight and set once it completes.
+	//
+	// The two must stay distinguishable, so a nil outcome is never RECORDED:
+	// Finalize releases the claim instead. A Provider is free to return
+	// (nil, nil), and storing that made the completed entry read as an
+	// unfinished claim.
 	result    *SendResult
 	expiresAt time.Time
 	// token identifies the caller holding an as-yet-resultless claim, so a
@@ -162,6 +172,13 @@ func (s *MemoryIdempotencyStore) Abandon(_ context.Context, key, token string) e
 
 // Finalize implements Reserver.
 func (s *MemoryIdempotencyStore) Finalize(_ context.Context, key, token string, result *SendResult, ttl time.Duration) error {
+	if token == "" {
+		// An empty token owns nothing. A completed entry carries no token, so
+		// accepting one here would let a tokenless call overwrite or delete an
+		// outcome some other caller recorded.
+		return ErrClaimSuperseded
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -169,6 +186,16 @@ func (s *MemoryIdempotencyStore) Finalize(_ context.Context, key, token string, 
 		// Someone else holds this key now, or has already recorded an outcome
 		// for it. Theirs is the current answer.
 		return ErrClaimSuperseded
+	}
+
+	if result == nil {
+		// Nothing to record, so RELEASE the claim rather than store a nil.
+		// A stored nil is indistinguishable from an unfinished claim, and it
+		// read as one: every retry got ErrSendInFlight until the TTL elapsed,
+		// and then sent anyway. Releasing lets the next caller through
+		// immediately, which is what a store with no recorded outcome means.
+		delete(s.entries, key)
+		return nil
 	}
 
 	// No entry at all means the claim expired and nothing replaced it. A send
@@ -406,6 +433,11 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 	//
 	// On a cleanup context: the message has already gone out, so recording it
 	// must not be skipped just because the caller's deadline has since passed.
+	//
+	// A nil result here -- which the Provider interface permits -- records
+	// nothing and releases the claim, because there is no outcome to hand a
+	// retry. The retry then sends again, exactly as it does without a
+	// Reserver, instead of being answered ErrSendInFlight for the whole TTL.
 	finalizeCtx, cancel := cleanupContext(ctx)
 	_ = reserver.Finalize(finalizeCtx, cacheKey, token, cloneSendResult(result), p.ttl)
 	cancel()

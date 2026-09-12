@@ -470,3 +470,95 @@ func TestOutcomeIsRecordedAfterTheCallerGivesUp(t *testing.T) {
 		})
 	}
 }
+
+// --- Codex review round 6 (PR #6) ---
+
+// nilResultProvider returns (nil, nil), which the Provider interface permits.
+type nilResultProvider struct{ sends int32 }
+
+func (p *nilResultProvider) Channel() Channel { return ChannelEmail }
+func (p *nilResultProvider) Name() string     { return "nil-result" }
+func (p *nilResultProvider) Validate() error  { return nil }
+
+func (p *nilResultProvider) Send(_ context.Context, _ *Message) (*SendResult, error) {
+	atomic.AddInt32(&p.sends, 1)
+	return nil, nil
+}
+
+// TestNilOutcomeDoesNotLookLikeAnInFlightClaim is the regression test for
+// finalizing a reservation with a nil result.
+//
+// The store marks an unfinished claim by carrying no result, so recording a
+// nil outcome made the COMPLETED entry indistinguishable from one still in
+// flight. Every retry was then answered ErrSendInFlight -- a hard error for a
+// send that had already returned successfully -- until the whole TTL elapsed,
+// and only then sent again.
+func TestNilOutcomeDoesNotLookLikeAnInFlightClaim(t *testing.T) {
+	base := &nilResultProvider{}
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	p := NewIdempotentProvider(base, &IdempotencyConfig{Store: store, TTL: time.Hour})
+	msg := func() *Message {
+		return NewMessage("test@example.com").WithBody("x").WithIdempotencyKey("nil-key")
+	}
+
+	if result, err := p.Send(context.Background(), msg()); err != nil || result != nil {
+		t.Fatalf("first Send = (%v, %v), want (nil, nil) passed through", result, err)
+	}
+
+	// The retry must not be told a send is still in flight: the first one
+	// returned, and the TTL here is an hour.
+	result, err := p.Send(context.Background(), msg())
+	if errors.Is(err, ErrSendInFlight) {
+		t.Fatal("a completed send with no result was reported as still in flight")
+	}
+	if err != nil || result != nil {
+		t.Fatalf("retry = (%v, %v), want (nil, nil)", result, err)
+	}
+	if got := atomic.LoadInt32(&base.sends); got != 2 {
+		t.Errorf("provider called %d times, want 2: with no outcome to hand back, the retry must send", got)
+	}
+}
+
+// TestFinalizeWithNilReleasesTheClaim covers the store rule directly, and the
+// fence that keeps a tokenless call from touching someone else's outcome.
+func TestFinalizeWithNilReleasesTheClaim(t *testing.T) {
+	store := NewMemoryIdempotencyStore()
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+
+	token, existing, err := store.Reserve(ctx, "k", time.Hour)
+	if err != nil || token == "" || existing != nil {
+		t.Fatalf("Reserve = (%q, %v, %v)", token, existing, err)
+	}
+
+	if err := store.Finalize(ctx, "k", token, nil, time.Hour); err != nil {
+		t.Fatalf("Finalize(nil) = %v", err)
+	}
+
+	// The claim is gone, so the next caller gets it rather than being told
+	// somebody else is mid-send.
+	next, existing, err := store.Reserve(ctx, "k", time.Hour)
+	if err != nil || existing != nil {
+		t.Fatalf("Reserve after Finalize(nil) = (%q, %v, %v)", next, existing, err)
+	}
+	if next == "" {
+		t.Fatal("the key still reads as claimed after a nil outcome released it")
+	}
+
+	// A recorded outcome carries no token, so a tokenless Finalize must not be
+	// able to delete or replace it.
+	result := &SendResult{OK: true, Provider: "p"}
+	if err := store.Finalize(ctx, "k", next, result, time.Hour); err != nil {
+		t.Fatalf("Finalize(result) = %v", err)
+	}
+	if err := store.Finalize(ctx, "k", "", nil, time.Hour); !errors.Is(err, ErrClaimSuperseded) {
+		t.Errorf("tokenless Finalize = %v, want ErrClaimSuperseded", err)
+	}
+	got, ok, err := store.Get(ctx, "k")
+	if err != nil || !ok || got == nil || got.Provider != "p" {
+		t.Errorf("recorded outcome after a tokenless Finalize = (%v, %v, %v)", got, ok, err)
+	}
+}
