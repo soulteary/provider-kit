@@ -367,7 +367,16 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 	if err != nil {
 		if result != nil {
 			// A definite outcome: record it so retries see the same answer.
-			_ = reserver.Finalize(ctx, cacheKey, token, cloneSendResult(result), p.ttl)
+			//
+			// On a cleanup context for the same reason Abandon is: an outcome
+			// that arrives after the deadline, or a cancellation landing
+			// between the provider returning and this call, would otherwise
+			// be rejected by a context-aware store -- so a message that DID
+			// go out is not recorded, and a retry sends it again once the
+			// reservation expires.
+			finalizeCtx, cancel := cleanupContext(ctx)
+			_ = reserver.Finalize(finalizeCtx, cacheKey, token, cloneSendResult(result), p.ttl)
+			cancel()
 		} else {
 			// No outcome to record. Release the claim so a retry is not
 			// blocked for the whole TTL.
@@ -377,7 +386,7 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 			// context-aware store would reject the cleanup on that very ctx,
 			// leaving the reservation standing and every retry answered with
 			// ErrSendInFlight until the TTL elapsed.
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonTimeout)
+			cleanupCtx, cancel := cleanupContext(ctx)
 			_ = reserver.Abandon(cleanupCtx, cacheKey, token)
 			cancel()
 		}
@@ -394,13 +403,30 @@ func (p *IdempotentProvider) Send(ctx context.Context, msg *Message) (*SendResul
 	// provider's own pointer let the caller go on mutating what the store had
 	// cached -- WithMetadata writes into the Metadata map the result
 	// constructors allocate -- and raced with readers cloning that same map.
-	_ = reserver.Finalize(ctx, cacheKey, token, cloneSendResult(result), p.ttl)
+	//
+	// On a cleanup context: the message has already gone out, so recording it
+	// must not be skipped just because the caller's deadline has since passed.
+	finalizeCtx, cancel := cleanupContext(ctx)
+	_ = reserver.Finalize(finalizeCtx, cacheKey, token, cloneSendResult(result), p.ttl)
+	cancel()
 
 	return result, nil
 }
 
-// abandonTimeout bounds the cleanup release of a reservation.
-const abandonTimeout = 5 * time.Second
+// cleanupContext derives a bounded context for finishing a reservation.
+//
+// Detached from ctx's cancellation: by the time a send has an outcome to
+// record -- or a claim to release -- the caller's context may already be
+// cancelled or past its deadline, and a context-aware store would reject the
+// write on it. The errors are discarded, so that failure is silent: an
+// outcome is lost and its reservation stands until expiry, after which a
+// retry sends the message a second time.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+}
+
+// cleanupTimeout bounds finishing a reservation once the send is over.
+const cleanupTimeout = 5 * time.Second
 
 // sendUnreserved is the legacy check-then-act path, used when the configured
 // store does not implement Reserver.

@@ -354,3 +354,119 @@ func (metadataProvider) Validate() error  { return nil }
 func (metadataProvider) Send(_ context.Context, _ *Message) (*SendResult, error) {
 	return &SendResult{OK: true, Provider: "original", Metadata: map[string]string{"id": "1"}}, nil
 }
+
+// ctxAwareStore rejects every operation on a dead context, like a shared
+// store speaking to Redis would. MemoryIdempotencyStore ignores its context,
+// so nothing in-tree can otherwise tell a cleanup context from a cancelled
+// one.
+type ctxAwareStore struct{ inner *MemoryIdempotencyStore }
+
+func (s *ctxAwareStore) Get(ctx context.Context, key string) (*SendResult, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	return s.inner.Get(ctx, key)
+}
+
+func (s *ctxAwareStore) Set(ctx context.Context, key string, r *SendResult, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.inner.Set(ctx, key, r, ttl)
+}
+
+func (s *ctxAwareStore) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.inner.Delete(ctx, key)
+}
+
+func (s *ctxAwareStore) Reserve(ctx context.Context, key string, ttl time.Duration) (string, *SendResult, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	return s.inner.Reserve(ctx, key, ttl)
+}
+
+func (s *ctxAwareStore) Abandon(ctx context.Context, key, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.inner.Abandon(ctx, key, token)
+}
+
+func (s *ctxAwareStore) Finalize(ctx context.Context, key, token string, r *SendResult, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.inner.Finalize(ctx, key, token, r, ttl)
+}
+
+// cancellingProvider cancels the caller's context just as it returns, standing
+// in for a deadline that expires while the provider is working.
+type cancellingProvider struct {
+	sends  int32
+	cancel func()
+	err    error
+}
+
+func (p *cancellingProvider) Channel() Channel { return ChannelEmail }
+func (p *cancellingProvider) Name() string     { return "cancelling" }
+func (p *cancellingProvider) Validate() error  { return nil }
+
+func (p *cancellingProvider) Send(_ context.Context, _ *Message) (*SendResult, error) {
+	atomic.AddInt32(&p.sends, 1)
+	p.cancel()
+	return &SendResult{OK: true, Provider: "cancelling"}, p.err
+}
+
+// TestOutcomeIsRecordedAfterTheCallerGivesUp is the regression test for
+// finalizing on the send's own context. A definite outcome arriving after the
+// deadline -- or a cancellation landing between the provider returning and the
+// write -- was rejected by a context-aware store, so a message that HAD gone
+// out was never recorded and its reservation stood until expiry. The retry
+// then sent it a second time, which is the one thing this wrapper exists to
+// prevent.
+func TestOutcomeIsRecordedAfterTheCallerGivesUp(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"success", nil},
+		{"definite outcome with an error", errors.New("rejected by carrier")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &ctxAwareStore{inner: NewMemoryIdempotencyStore()}
+			defer func() { _ = store.inner.Close() }()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			prov := &cancellingProvider{cancel: cancel, err: tc.err}
+			p := NewIdempotentProvider(prov, &IdempotencyConfig{Store: store, TTL: time.Minute})
+			msg := &Message{To: "a@example.org", IdempotencyKey: "k"}
+
+			if _, err := p.Send(ctx, msg); !errors.Is(err, tc.err) {
+				t.Fatalf("Send error = %v, want %v", err, tc.err)
+			}
+
+			// The caller retries on a fresh context. The outcome must already
+			// be recorded, so the provider is not called again.
+			//
+			// A cached outcome comes back as (result, nil) whatever the
+			// original error was -- the error rides in SendResult -- so the
+			// provider call count is what says it was recorded.
+			cached, err := p.Send(context.Background(), msg)
+			if err != nil {
+				t.Fatalf("retry error = %v, want the cached outcome", err)
+			}
+			if cached == nil || cached.Provider != "cancelling" {
+				t.Errorf("retry returned %+v, want the recorded result", cached)
+			}
+			if got := atomic.LoadInt32(&prov.sends); got != 1 {
+				t.Errorf("provider was called %d times, want 1; the outcome was not recorded", got)
+			}
+		})
+	}
+}
