@@ -419,7 +419,7 @@ retry-on-error caller send it twice.
 
 ## Requirements
 
-- **Go 1.27+** (`go.mod` declares `go 1.27.0`)
+- **Go 1.27+** (`go.mod` declares `go 1.27.2`)
 
 ## License
 
