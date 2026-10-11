@@ -1,11 +1,11 @@
 # Go Report Card
 
-**Grade: B** (76.5%)
+**Grade: A+** (99.3%)
 
 | Metric | Value |
 | ------ | ----- |
 | Files | 33 |
-| Issues | 0 |
+| Issues | 2 |
 
 ## Checks
 
@@ -13,12 +13,19 @@
 | ----- | ----- |
 | gofmt | 100% |
 | go_vet | 100% |
-| ineffassign | 0% |
-| gocyclo | 0% |
+| gocyclo | 93% |
+| ineffassign | 100% |
 | license | 100% |
-| misspell | 0% |
+| misspell | 100% |
 
-No issues found. Nice work!
+## Issues
+
+### gocyclo
+
+- `smtp_mock_test.go`
+  - Line 107: cyclomatic complexity 29 for function serveMockSMTP
+- `http.go`
+  - Line 243: cyclomatic complexity 18 for function (*HTTPProvider).Send
 
 ---
 
