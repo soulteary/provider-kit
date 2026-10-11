@@ -190,6 +190,10 @@ jobs:
         threshold: "0"
         report: "true"
         commit: "false"
+    - name: Validate complete Go quality evidence
+      if: "!cancelled() && steps.go_report_card.outcome == 'success'"
+      shell: bash
+      run: python3 .github/scripts/verify-go-report.py
     - name: Upload stable reports
       if: "always() && steps.report_cleanup.outcome == 'success'"
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
