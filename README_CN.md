@@ -400,7 +400,7 @@ go tool cover -func=coverage.out
 
 ## 环境要求
 
-- **Go 1.27+**（`go.mod` 声明 `go 1.27.2`）
+- **Go 1.27.2+**（`go.mod` 声明 `go 1.27.2`）
 
 ## 许可证
 
