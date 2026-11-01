@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -97,6 +98,11 @@ func (c *HTTPConfig) Validate() error {
 	if c.RequireHTTPS && u.Scheme != "https" {
 		return ErrInvalidConfig("HTTP base URL must use https scheme")
 	}
+	switch c.Redirect {
+	case "", RedirectDeny, RedirectSameOrigin:
+	default:
+		return ErrInvalidConfig("HTTP redirect policy must be deny or same-origin")
+	}
 	return nil
 }
 
@@ -112,6 +118,12 @@ func NewHTTPProvider(config *HTTPConfig) (*HTTPProvider, error) {
 	if config == nil {
 		config = DefaultHTTPConfig()
 	}
+
+	// Do not retain caller-owned configuration or header maps: later mutation
+	// must not bypass RequireHTTPS or alter the credential/redirect policy.
+	configCopy := *config
+	configCopy.Headers = maps.Clone(config.Headers)
+	config = &configCopy
 
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -319,20 +331,36 @@ func (p *HTTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, err
 	if limit <= 0 {
 		limit = defaultMaxResponseBytes
 	}
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	readLimit := limit
+	if readLimit < 1<<63-1 {
+		readLimit++
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, readLimit))
 	if err != nil {
 		providerErr := ErrSendFailed("failed to read response", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+	}
+
+	if int64(len(respBody)) > limit {
+		providerErr := ErrSendFailed("provider response exceeds size limit", nil).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Preserve structured failure reasons, but never accept OK=true on an
+		// unsuccessful HTTP status or include an unstructured response body in errors.
+		var failure HTTPSendResponse
+		if json.Unmarshal(respBody, &failure) == nil && !failure.OK && failure.ErrorCode != "" {
+			providerErr := p.mapErrorCode(failure.ErrorCode, failure.ErrorMessage)
+			return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+		}
+		providerErr := ErrSendFailed(fmt.Sprintf("provider returned HTTP %d", resp.StatusCode), nil).WithProvider(p.config.ProviderName, p.config.ChannelType)
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
 	}
 
 	// Parse response
 	var sendResp HTTPSendResponse
 	if err := json.Unmarshal(respBody, &sendResp); err != nil {
-		// If we can't parse the response, check HTTP status
-		if resp.StatusCode >= 400 {
-			providerErr := ErrSendFailed(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(respBody)), nil).WithProvider(p.config.ProviderName, p.config.ChannelType)
-			return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
-		}
+
 		providerErr := ErrSendFailed("failed to parse response", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
 	}
