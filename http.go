@@ -282,39 +282,9 @@ func (p *HTTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, err
 		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
 	}
 
-	// Build HTTP request. Resolve the endpoint against the parsed base URL so a
-	// stray/missing slash or an absolute endpoint cannot silently retarget the
-	// request to a different host.
-	base, err := url.Parse(p.config.BaseURL)
-	if err != nil {
-		providerErr := ErrSendFailed("invalid base URL", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
-		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
-	}
-	ref, err := url.Parse(p.config.SendEndpoint)
-	if err != nil {
-		providerErr := ErrSendFailed("invalid send endpoint", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
-		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
-	}
-	resolved := base.ResolveReference(ref)
-	// A relative send endpoint must not change the origin.
-	if !strings.EqualFold(resolved.Scheme, base.Scheme) || !strings.EqualFold(resolved.Host, base.Host) {
-		providerErr := ErrSendFailed("send endpoint resolves to a different origin", nil).WithProvider(p.config.ProviderName, p.config.ChannelType)
-		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, resolved.String(), bytes.NewReader(jsonBody))
-	if err != nil {
-		providerErr := ErrSendFailed("failed to create request", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
-		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Idempotency-Key", idempotencyKey)
-	if p.config.APIKey != "" {
-		req.Header.Set(p.config.APIKeyHeader, p.config.APIKey)
-	}
-	for k, v := range p.config.Headers {
-		req.Header.Set(k, v)
+	req, requestErr := p.newSendRequest(ctx, jsonBody, idempotencyKey)
+	if requestErr != nil {
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, requestErr), requestErr
 	}
 
 	// Execute request
@@ -325,26 +295,11 @@ func (p *HTTPProvider) Send(ctx context.Context, msg *Message) (*SendResult, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Read response body with a hard cap so a hostile/oversized response cannot
-	// exhaust memory.
-	limit := p.config.MaxResponseBytes
-	if limit <= 0 {
-		limit = defaultMaxResponseBytes
-	}
-	readLimit := limit
-	if readLimit < 1<<63-1 {
-		readLimit++
-	}
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, readLimit))
-	if err != nil {
-		providerErr := ErrSendFailed("failed to read response", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
-		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
+	respBody, readErr := p.readSendResponse(resp.Body)
+	if readErr != nil {
+		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, readErr), readErr
 	}
 
-	if int64(len(respBody)) > limit {
-		providerErr := ErrSendFailed("provider response exceeds size limit", nil).WithProvider(p.config.ProviderName, p.config.ChannelType)
-		return NewFailureResult(p.config.ProviderName, p.config.ChannelType, providerErr), providerErr
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Preserve structured failure reasons, but never accept OK=true on an
 		// unsuccessful HTTP status or include an unstructured response body in errors.
@@ -415,4 +370,67 @@ func (p *HTTPProvider) SetHTTPClient(client *http.Client) {
 // HTTPProviderFactory is the factory for HTTP providers
 func HTTPProviderFactory(config map[string]string) (Provider, error) {
 	return NewHTTPProviderFromMap(config)
+}
+
+func (p *HTTPProvider) newSendRequest(ctx context.Context, jsonBody []byte, idempotencyKey string) (*http.Request, *ProviderError) {
+	// Build HTTP request. Resolve the endpoint against the parsed base URL so a
+	// stray/missing slash or an absolute endpoint cannot silently retarget the
+	// request to a different host.
+	base, err := url.Parse(p.config.BaseURL)
+	if err != nil {
+		providerErr := ErrSendFailed("invalid base URL", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return nil, providerErr
+	}
+	ref, err := url.Parse(p.config.SendEndpoint)
+	if err != nil {
+		providerErr := ErrSendFailed("invalid send endpoint", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return nil, providerErr
+	}
+	resolved := base.ResolveReference(ref)
+	// A relative send endpoint must not change the origin.
+	if !strings.EqualFold(resolved.Scheme, base.Scheme) || !strings.EqualFold(resolved.Host, base.Host) {
+		providerErr := ErrSendFailed("send endpoint resolves to a different origin", nil).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return nil, providerErr
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, resolved.String(), bytes.NewReader(jsonBody))
+	if err != nil {
+		providerErr := ErrSendFailed("failed to create request", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return nil, providerErr
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", idempotencyKey)
+	if p.config.APIKey != "" {
+		req.Header.Set(p.config.APIKeyHeader, p.config.APIKey)
+	}
+	for k, v := range p.config.Headers {
+		req.Header.Set(k, v)
+	}
+
+	return req, nil
+}
+
+func (p *HTTPProvider) readSendResponse(body io.Reader) ([]byte, *ProviderError) {
+	// Read response body with a hard cap so a hostile/oversized response cannot
+	// exhaust memory.
+	limit := p.config.MaxResponseBytes
+	if limit <= 0 {
+		limit = defaultMaxResponseBytes
+	}
+	readLimit := limit
+	if readLimit < 1<<63-1 {
+		readLimit++
+	}
+	respBody, err := io.ReadAll(io.LimitReader(body, readLimit))
+	if err != nil {
+		providerErr := ErrSendFailed("failed to read response", err).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return nil, providerErr
+	}
+
+	if int64(len(respBody)) > limit {
+		providerErr := ErrSendFailed("provider response exceeds size limit", nil).WithProvider(p.config.ProviderName, p.config.ChannelType)
+		return nil, providerErr
+	}
+	return respBody, nil
 }
