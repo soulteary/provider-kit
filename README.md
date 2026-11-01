@@ -425,3 +425,21 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## HTTP transport contract
+
+`NewHTTPProvider` snapshots configuration and copies the header map. Changing the
+caller's config later cannot disable HTTPS, change credentials, or weaken redirect
+policy; construct a new provider to apply configuration changes. Unknown redirect
+policies are rejected instead of implicitly allowing same-origin redirects.
+
+A successful send requires a 2xx status, a complete response within
+`MaxResponseBytes`, valid JSON, and `ok: true`. A valid JSON success prefix does
+not make an oversized response valid. Non-2xx responses fail even if their JSON
+claims success; structured failure reasons remain available. Unstructured error
+bodies are not included in returned error strings. TLS certificate verification,
+the TLS 1.2 minimum, and cross-origin redirect blocking remain enabled by default.
+SMTP with STARTTLS enabled fails if the upgrade fails; it does not fall back to
+sending credentials or the message over plaintext. Plain SMTP and
+`SkipTLSVerify` remain explicit caller-controlled options and are not enabled by
+Herald's built-in SMTP configuration.

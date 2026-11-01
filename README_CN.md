@@ -409,3 +409,15 @@ go tool cover -func=coverage.out
 ## 贡献
 
 欢迎贡献！请随时提交 Pull Request。
+
+## HTTP 传输契约
+
+`NewHTTPProvider` 会复制配置和请求头映射。构造后修改原配置，不能关闭 HTTPS、修改凭据
+或放宽重定向策略；需要更新配置时应创建新的 provider。未知重定向策略会被拒绝。
+
+成功发送要求 HTTP 2xx、完整且不超过 `MaxResponseBytes` 的响应、有效 JSON，以及
+`ok: true`。超长响应即使以合法成功 JSON 开头也会被拒绝；非 2xx 响应不能通过 JSON 中的
+成功标记绕过检查，结构化失败原因仍会保留。非结构化错误响应正文不再进入返回的错误字符串。
+默认 TLS 证书校验、TLS 1.2 下限和跨源重定向阻断保持生效。
+SMTP 启用 STARTTLS 后，升级失败不会降级为明文发送凭据或消息。明文 SMTP 和
+`SkipTLSVerify` 仍属于调用方明确配置的选项，Herald 内置 SMTP 配置不会启用它们。
