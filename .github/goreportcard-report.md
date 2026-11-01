@@ -1,11 +1,11 @@
 # Go Report Card
 
-**Grade: A+** (99.3%)
+**Grade: A+** (99.0%)
 
 | Metric | Value |
 | ------ | ----- |
-| Files | 33 |
-| Issues | 2 |
+| Files | 35 |
+| Issues | 3 |
 
 ## Checks
 
@@ -13,7 +13,7 @@
 | ----- | ----- |
 | go_vet | 100% |
 | gofmt | 100% |
-| gocyclo | 93% |
+| gocyclo | 91% |
 | ineffassign | 100% |
 | license | 100% |
 | misspell | 100% |
@@ -22,10 +22,12 @@
 
 ### gocyclo
 
+- `security_audit_test.go`
+  - Line 93: cyclomatic complexity 18 for function TestSecurityAudit_SMTPRefusesSTARTTLSDowngrade
 - `smtp_mock_test.go`
   - Line 107: cyclomatic complexity 29 for function serveMockSMTP
 - `http.go`
-  - Line 243: cyclomatic complexity 18 for function (*HTTPProvider).Send
+  - Line 255: cyclomatic complexity 24 for function (*HTTPProvider).Send
 
 ---
 
