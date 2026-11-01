@@ -97,36 +97,8 @@ func TestSecurityAudit_SMTPRefusesSTARTTLSDowngrade(t *testing.T) {
 	}
 	defer func() { _ = listener.Close() }()
 	observed := make(chan []string, 1)
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			observed <- nil
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-		_, _ = conn.Write([]byte("220 audit SMTP\r\n"))
-		var seen []string
-		reader := bufio.NewReader(conn)
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				break
-			}
-			seen = append(seen, line)
-			reply := "550 refused\r\n"
-			if strings.HasPrefix(line, "EHLO") {
-				reply = "250 audit SMTP\r\n"
-			}
-			if strings.HasPrefix(line, "STARTTLS") {
-				reply = "454 TLS unavailable\r\n"
-			}
-			if _, err = conn.Write([]byte(reply)); err != nil {
-				break
-			}
-		}
-		observed <- seen
-	}()
+	go observeSTARTTLSRefusal(listener, observed)
+
 	addr := listener.Addr().(*net.TCPAddr)
 	p, err := NewSMTPProvider(&SMTPConfig{Host: "127.0.0.1", Port: addr.Port, From: "sender@example.com", Username: "test-user", Password: "test-password", UseStartTLS: true, Timeout: time.Second})
 	if err != nil {
@@ -201,4 +173,35 @@ func TestSecurityAudit_HTTPBoundariesAndFailureReasons(t *testing.T) {
 			}
 		})
 	}
+}
+
+func observeSTARTTLSRefusal(listener net.Listener, observed chan<- []string) {
+	conn, err := listener.Accept()
+	if err != nil {
+		observed <- nil
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = conn.Write([]byte("220 audit SMTP\r\n"))
+	var seen []string
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		seen = append(seen, line)
+		reply := "550 refused\r\n"
+		if strings.HasPrefix(line, "EHLO") {
+			reply = "250 audit SMTP\r\n"
+		}
+		if strings.HasPrefix(line, "STARTTLS") {
+			reply = "454 TLS unavailable\r\n"
+		}
+		if _, err = conn.Write([]byte(reply)); err != nil {
+			break
+		}
+	}
+	observed <- seen
 }

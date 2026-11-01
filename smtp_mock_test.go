@@ -105,88 +105,91 @@ func mockSMTPTLSPipe(t *testing.T, startTLS bool) net.Conn {
 }
 
 func serveMockSMTP(conn net.Conn, authSeen chan<- bool, startTLSConfig *tls.Config) {
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
-	writeReply := func(reply string) bool {
-		if _, err := writer.WriteString(reply); err != nil {
-			return false
-		}
-		return writer.Flush() == nil
-	}
-	if !writeReply("220 mock SMTP\r\n") {
+	mock := &mockSMTPSession{conn: conn, reader: bufio.NewReader(conn), writer: bufio.NewWriter(conn), authSeen: authSeen, tlsConfig: startTLSConfig}
+	if !mock.reply("220 mock SMTP\r\n") {
 		return
 	}
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
+		line, err := mock.reader.ReadString('\n')
+		if err != nil || !mock.command(strings.ToUpper(strings.TrimSpace(line))) {
 			return
 		}
-		upper := strings.ToUpper(strings.TrimSpace(line))
-		switch {
-		case strings.HasPrefix(upper, "EHLO"):
-			if startTLSConfig != nil {
-				if !writeReply("250-mock\r\n250 STARTTLS\r\n") {
-					return
-				}
-				continue
-			}
-			if !writeReply("250-mock\r\n250 AUTH PLAIN\r\n") {
-				return
-			}
-		case strings.HasPrefix(upper, "HELO"):
-			if !writeReply("250 mock\r\n") {
-				return
-			}
-		case upper == "STARTTLS" && startTLSConfig != nil:
-			if !writeReply("220 ready for TLS\r\n") {
-				return
-			}
-			tlsServer := tls.Server(conn, startTLSConfig)
-			if err := tlsServer.Handshake(); err != nil {
-				return
-			}
-			conn = tlsServer
-			reader = bufio.NewReader(conn)
-			writer = bufio.NewWriter(conn)
-			startTLSConfig = nil
-		case strings.HasPrefix(upper, "AUTH PLAIN"):
-			if authSeen != nil {
-				authSeen <- true
-			}
-			if !writeReply("235 authenticated\r\n") {
-				return
-			}
-		case strings.HasPrefix(upper, "MAIL FROM"), strings.HasPrefix(upper, "RCPT TO"):
-			if !writeReply("250 ok\r\n") {
-				return
-			}
-		case upper == "DATA":
-			if !writeReply("354 end with dot\r\n") {
-				return
-			}
-			for {
-				dataLine, readErr := reader.ReadString('\n')
-				if readErr != nil {
-					return
-				}
-				if dataLine == ".\r\n" {
-					break
-				}
-			}
-			if !writeReply("250 queued\r\n") {
-				return
-			}
-		case upper == "QUIT":
-			_ = writeReply("221 bye\r\n")
-			if _, encrypted := conn.(*tls.Conn); !encrypted {
-				return
-			}
-		default:
-			if !writeReply("500 unsupported\r\n") {
-				return
-			}
+	}
+}
+
+type mockSMTPSession struct {
+	conn      net.Conn
+	reader    *bufio.Reader
+	writer    *bufio.Writer
+	authSeen  chan<- bool
+	tlsConfig *tls.Config
+}
+
+func (s *mockSMTPSession) reply(reply string) bool {
+	if _, err := s.writer.WriteString(reply); err != nil {
+		return false
+	}
+	return s.writer.Flush() == nil
+}
+
+func (s *mockSMTPSession) command(upper string) bool {
+	switch {
+	case strings.HasPrefix(upper, "EHLO"):
+		if s.tlsConfig != nil {
+			return s.reply("250-mock\r\n250 STARTTLS\r\n")
+		}
+		return s.reply("250-mock\r\n250 AUTH PLAIN\r\n")
+	case strings.HasPrefix(upper, "HELO"):
+		return s.reply("250 mock\r\n")
+	case upper == "STARTTLS" && s.tlsConfig != nil:
+		return s.upgradeTLS()
+	case strings.HasPrefix(upper, "AUTH PLAIN"):
+		if s.authSeen != nil {
+			s.authSeen <- true
+		}
+		return s.reply("235 authenticated\r\n")
+	case strings.HasPrefix(upper, "MAIL FROM"), strings.HasPrefix(upper, "RCPT TO"):
+		return s.reply("250 ok\r\n")
+	case upper == "DATA":
+		return s.readData()
+	case upper == "QUIT":
+		_ = s.reply("221 bye\r\n")
+		_, encrypted := s.conn.(*tls.Conn)
+		return encrypted
+	default:
+		return s.reply("500 unsupported\r\n")
+	}
+}
+
+func (s *mockSMTPSession) upgradeTLS() bool {
+	if !s.reply("220 ready for TLS\r\n") {
+		return false
+	}
+	conn := tls.Server(s.conn, s.tlsConfig)
+	if err := conn.Handshake(); err != nil {
+		return false
+	}
+	s.conn = conn
+	s.reader = bufio.NewReader(conn)
+	s.writer = bufio.NewWriter(conn)
+	s.tlsConfig = nil
+	return true
+}
+
+func (s *mockSMTPSession) readData() bool {
+	if !s.reply("354 end with dot\r\n") {
+		return false
+	}
+	for {
+		line, err := s.reader.ReadString('\n')
+		if err != nil {
+			return false
+		}
+		if line == ".\r\n" {
+			break
 		}
 	}
+	return s.reply("250 queued\r\n")
 }
 
 func testServerTLSConfig(t *testing.T) *tls.Config {
