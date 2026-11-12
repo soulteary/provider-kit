@@ -515,11 +515,6 @@ func TestSMTPProvider_sendWithClient_AllErrors(t *testing.T) {
 			client:  &testSMTPClient{closeErr: errors.New("close failed")},
 			wantErr: "close writer failed",
 		},
-		{
-			name:    "quit error",
-			client:  &testSMTPClient{quitErr: errors.New("quit failed")},
-			wantErr: "quit failed",
-		},
 	}
 
 	for _, tt := range tests {
@@ -532,6 +527,22 @@ func TestSMTPProvider_sendWithClient_AllErrors(t *testing.T) {
 				t.Errorf("sendWithClient() error = %v, should contain %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// The server has accepted the message once the DATA writer closes. A QUIT
+// error after that is not a delivery failure.
+func TestSMTPProvider_sendWithClient_QuitErrorAfterAcceptedData(t *testing.T) {
+	provider := &SMTPProvider{
+		config: &SMTPConfig{
+			Host: "smtp.example.com",
+			Port: 587,
+			From: "sender@example.com",
+		},
+	}
+	client := &testSMTPClient{quitErr: errors.New("connection reset by peer")}
+	if err := provider.sendWithClient(client, "recipient@example.com", []byte("test")); err != nil {
+		t.Fatalf("sendWithClient() = %v, want nil after the message was accepted", err)
 	}
 }
 
