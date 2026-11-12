@@ -477,7 +477,13 @@ func (p *SMTPProvider) sendWithClient(client smtpClientInterface, to string, bod
 		return fmt.Errorf("close writer failed: %w", err)
 	}
 
-	return client.Quit()
+	// Closing the DATA writer returns only after the server has accepted the
+	// message. A QUIT failure after that point (the server dropping the
+	// connection, for example) does not undo delivery, so it must not be
+	// reported as a failed send: the caller would retry or revoke a message
+	// that has already been delivered.
+	_ = client.Quit()
+	return nil
 }
 
 // SMTPProviderFactory is the factory for SMTP providers
